@@ -689,7 +689,7 @@ fn.register(
   0x0ca,
   "sysctl",
   ["bigint", "number", "bigint", "bigint", "bigint", "bigint"],
-  "bigint",
+  "bigint"
 );
 var sysctl = fn.sysctl;
 function sysctlbyname(name, oldp, oldp_len, newp, newp_len) {
@@ -703,7 +703,7 @@ function sysctlbyname(name, oldp, oldp_len, newp, newp_len) {
   var name_len = new BigInt(name.length);
   if (
     sysctl(translate_name_mib, 2, mib, size, name_addr, name_len).eq(
-      new BigInt(0xffffffff, 0xffffffff),
+      new BigInt(0xffffffff, 0xffffffff)
     )
   ) {
     log("failed to translate sysctl name to mib (" + name + ")");
@@ -714,7 +714,7 @@ function sysctlbyname(name, oldp, oldp_len, newp, newp_len) {
   newp_len = typeof newp_len === "number" ? new BigInt(newp_len) : newp_len;
   if (
     sysctl(mib, 2, oldp, oldp_len, newp, newp_len).eq(
-      new BigInt(0xffffffff, 0xffffffff),
+      new BigInt(0xffffffff, 0xffffffff)
     )
   ) {
     return false;
@@ -747,7 +747,7 @@ fn.register(
   477,
   "mmap",
   ["bigint", "number", "number", "number", "bigint", "number"],
-  "bigint",
+  "bigint"
 );
 fn.register(0x49, "munmap", ["bigint", "number"], "bigint");
 var getuid = fn.getuid;
@@ -787,7 +787,7 @@ function jailbreak_shared(FW_VERSION) {
   kernel.write_qword(ucred.add(0x60), new BigInt(0xffffffff, 0xffffffff)); // sceCaps
   kernel.write_qword(ucred.add(0x68), new BigInt(0xffffffff, 0xffffffff));
   var rootvnode = kernel.read_qword(
-    kernel.addr.base.add(kernel_offset.ROOTVNODE),
+    kernel.addr.base.add(kernel_offset.ROOTVNODE)
   );
   if (!rootvnode) {
     throw new Error("Failed to read rootvnode");
@@ -831,7 +831,7 @@ function jailbreak_shared(FW_VERSION) {
             " [" +
             hex(mmap_offsets[1]) +
             "]=" +
-            hex(b2 !== null && b2 !== void 0 ? b2 : 0),
+            hex(b2 !== null && b2 !== void 0 ? b2 : 0)
         );
         all_patches_ok = false;
       }
@@ -850,7 +850,7 @@ function jailbreak_shared(FW_VERSION) {
         PROT_RWX,
         MAP_PRIVATE | MAP_ANON,
         new BigInt(0xffffffff, 0xffffffff),
-        0,
+        0
       );
       if (Number(test_addr.shr(32)) < 0xffff8000) {
         debug("  [OK] mmap RWX functional @ " + hex(test_addr));
@@ -912,15 +912,15 @@ function apply_kernel_patches(fw_version) {
     var sy_thrcnt = kernel.read_dword(sysent_661_addr.add(0x2c));
     debug(
       "Original sy_narg: " +
-        hex(sy_narg !== null && sy_narg !== void 0 ? sy_narg : 0),
+        hex(sy_narg !== null && sy_narg !== void 0 ? sy_narg : 0)
     );
     debug(
       "Original sy_call: " +
-        hex(sy_call !== null && sy_call !== void 0 ? sy_call : 0),
+        hex(sy_call !== null && sy_call !== void 0 ? sy_call : 0)
     );
     debug(
       "Original sy_thrcnt: " +
-        hex(sy_thrcnt !== null && sy_thrcnt !== void 0 ? sy_thrcnt : 0),
+        hex(sy_thrcnt !== null && sy_thrcnt !== void 0 ? sy_thrcnt : 0)
     );
     if (!sy_narg || !sy_call || !sy_thrcnt) {
       debug("ERROR: Failed to read original sysent[661] values");
@@ -956,7 +956,7 @@ function apply_kernel_patches(fw_version) {
     var jitshm_gadget = syscalls.map.get(jitshm_num);
     debug(
       "jitshm_create gadget: " +
-        (jitshm_gadget ? hex(jitshm_gadget) : "NOT FOUND"),
+        (jitshm_gadget ? hex(jitshm_gadget) : "NOT FOUND")
     );
 
     // Try using the standard syscall() function if gadget exists
@@ -986,7 +986,7 @@ function apply_kernel_patches(fw_version) {
       PROT_RWX,
       0x11,
       exec_handle,
-      0,
+      0
     );
     debug("mmap result: " + hex(mmap_result));
     if (Number(mmap_result.shr(32)) >= 0xffff8000) {
@@ -1182,7 +1182,7 @@ function apply_kernel_patches(fw_version) {
               ": expected " +
               hex(p.exp) +
               ", got " +
-              hex(actual),
+              hex(actual)
           );
           patch_errors++;
         }
@@ -1201,8 +1201,8 @@ function apply_kernel_patches(fw_version) {
             hex(
               sysent11_call !== null && sysent11_call !== void 0
                 ? sysent11_call
-                : 0,
-            ),
+                : 0
+            )
         );
         patch_errors++;
       }
