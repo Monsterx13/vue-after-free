@@ -10,6 +10,7 @@ include("userland.js");
 if (typeof libc_addr === "undefined") include("userland.js");
 include("kernel.js");
 include("binloader.js");
+import { fn } from 'types.js';
 
 // ======================== Syscall wrappers ========================
 if (!String.prototype.padStart) {
