@@ -128,7 +128,7 @@ if (!is_jailbroken) {
         log(
           "ERROR: Timeout waiting for exploit to complete (" +
             max_wait_seconds +
-            " seconds)",
+            " seconds)"
         );
         throw new Error("Lapse failed! restart and try again...");
       }
