@@ -19,6 +19,9 @@ function _arrayWithHoles(r) { if (Array.isArray(r)) return r; }
 
 /* ============ missing syscall registrations ============ */
 include('types.js');
+include('userland.js');
+include('kernel.js');
+include('loader.js');
 
 fn.register(0x29, "dup", ["bigint"], "bigint");
 fn.register(0x06, "close", ["bigint"], "bigint");
