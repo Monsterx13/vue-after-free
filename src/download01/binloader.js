@@ -4,6 +4,8 @@
 // Usage: include('binloader.js') before userland/lapse
 //        After lapse completes, call: binloader_init()
 include('types.js');
+include('userland.js');
+include('loader.js');
 
 var binloader_auto_run_done = false;
 function binloader_init() {
