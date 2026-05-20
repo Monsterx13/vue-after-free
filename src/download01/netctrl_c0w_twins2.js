@@ -3,8 +3,10 @@
 if (typeof libc_addr === "undefined") {
   include("userland.js");
 }
-include("kernel.js");
-include("binloader.js");
+include('types.js');
+include('kernel.js');
+
+
 if (!String.prototype.padStart) {
   String.prototype.padStart = function padStart(targetLength, padString) {
     targetLength = targetLength >> 0; // truncate if number or convert non-number to 0
