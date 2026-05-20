@@ -3,8 +3,10 @@
 if (typeof libc_addr === 'undefined') {
   include('userland.js');
 }
+include('types.js');
 include('kernel.js');
 include('binloader.js');
+
 import { fn } from 'types.js';
 if (!String.prototype.padStart) {
   String.prototype.padStart = function padStart(targetLength, padString) {
@@ -554,8 +556,8 @@ function init() {
     var bmin = Number(b_arr[1]);
     return amaj === bmaj ? amin - bmin : amaj - bmaj;
   };
-  if (compare_version(FW_VERSION, '9.00') < 0 || compare_version(FW_VERSION, '13.00') > 0) {
-    log('Unsupported PS4 firmware\nSupported: 9.00-13.00\nAborting...');
+  if (compare_version(FW_VERSION, '9.00') < 0 || compare_version(FW_VERSION, '13.02') > 0) {
+    log('Unsupported PS4 firmware\nSupported: 9.00-13.02\nAborting...');
     send_notification('Unsupported PS4 firmware\nAborting...');
     return false;
   }
