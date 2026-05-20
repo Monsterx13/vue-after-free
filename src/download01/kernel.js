@@ -1,5 +1,5 @@
 /** *** kernel_offset.js *****/
-
+include('types.js');
 // PS4 Kernel Offsets for Lapse exploit
 // Source: https://github.com/Helloyunho/yarpe/blob/main/payloads/lapse.py
 
