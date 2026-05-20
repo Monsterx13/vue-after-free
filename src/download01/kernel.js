@@ -1220,6 +1220,7 @@ function apply_kernel_patches(fw_version) {
     kernel.write_dword(sysent_661_addr.add(0x2c), sy_thrcnt);
     debug("Restored sysent[661]");
     debug("Kernel patches applied!");
+    debug("Kernel.js Done");
     return true;
   } catch (e) {
     var _stack;
