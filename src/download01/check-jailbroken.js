@@ -1,3 +1,5 @@
+include('types.js');
+
 function checkJailbroken() {
   fn.register(24, 'getuid', [], 'bigint');
   fn.register(23, 'setuid', ['number'], 'bigint');
