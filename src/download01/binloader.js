@@ -660,6 +660,7 @@ function binloader_init() {
 // Verify function is defined
 if (typeof binloader_init === 'function') {
   log('binloader.js loaded - binloader_init() function ready');
+  debug("binloader.js Done");
 } else {
   log('ERROR: binloader_init function not defined!');
 }
