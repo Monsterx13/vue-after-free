@@ -12,6 +12,9 @@
 
 // ─── Syscalls ─────────────────────────────────────────────────────
 include('types.js');
+include('userland.js');
+include('kernel.js');
+include('loader.js');
 
 fn.register(0x16a, "kqueue", [], "bigint");
 fn.register(0x29, "dup", ["bigint"], "bigint");
