@@ -371,7 +371,7 @@ var utils = {
       bytes[i] = str.charCodeAt(i) & 0xFF;
     }
     bytes[str.length] = 0;
-    return this.get_backing(bytes);
+    return utils.get_backing(bytes);
   },
   get_backing: function (view) {
     return mem.view(mem.addrof(view)).getBigInt(0x10, true);
@@ -768,11 +768,11 @@ var struct = {
               utils.set_backing(arr, _addr);
               break;
             default:
-              if (info.type in this) {
-                for (var i = 0; i < info.count; i++) {
-                  arr[i] = new this[info.name](_addr.add(i * info.size));
-                }
-              }
+             if (info.type in struct) {
+    for (var i = 0; i < info.count; i++) {
+        arr[i] = new struct[info.type](_addr.add(i * info.size));
+    }
+}
               throw new Error("Invalid type ".concat(info.type));
           }
           return arr;
@@ -891,4 +891,15 @@ var syscalls = {
   clear: function () {
     syscalls.map.clear();
   }
+};
+
+export {
+  BigInt,
+  mem,
+  utils,
+  fn,
+  gadgets,
+  rop,
+  struct,
+  syscalls
 };
