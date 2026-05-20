@@ -18,7 +18,8 @@ function _arrayWithHoles(r) { if (Array.isArray(r)) return r; }
  */
 
 /* ============ missing syscall registrations ============ */
-import { fn } from 'types.js';
+include('types.js');
+
 fn.register(0x29, "dup", ["bigint"], "bigint");
 fn.register(0x06, "close", ["bigint"], "bigint");
 fn.register(0x03, "read", ["bigint", "bigint", "number"], "bigint");
