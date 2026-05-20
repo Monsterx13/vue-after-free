@@ -11,16 +11,7 @@
  */
 
 // ─── Syscalls ─────────────────────────────────────────────────────
-import {
-  BigInt,
-  fn,
-  syscalls,
-  rop,
-  gadgets,
-  utils,
-  mem,
-  struct
-} from './types.js';
+include('types.js');
 
 fn.register(0x16a, "kqueue", [], "bigint");
 fn.register(0x29, "dup", ["bigint"], "bigint");
