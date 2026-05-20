@@ -1,3 +1,5 @@
+include('types.js');
+
 function make_uaf(arr) {
   var o = {};
   for (var i in {
