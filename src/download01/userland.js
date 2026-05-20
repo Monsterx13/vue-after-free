@@ -152,5 +152,5 @@ fn.register(0x29, 'dup', ['bigint'], 'bigint');
 fn.register(0x4, 'write', ['bigint', 'bigint', 'number'], 'bigint');
 fn.register(0x5, 'open', ['bigint', 'number', 'number'], 'bigint');
 fn.register(0x6, 'close', ['bigint'], 'bigint');
-
+debug("Userland.js Done");
 // utils.notify('UwU')
