@@ -5,8 +5,11 @@
 //  Firmware: 9.00 – 13.02
 //  Requires: userland.js, kernel.js, binloader.js
 // =============================================================================
+include('types.js');
+include('userland.js');
+include('kernel.js');
+include('loader.js');
 
-include("userland.js");
 if (typeof libc_addr === "undefined") include("userland.js");
 include("kernel.js");
 include("binloader.js");
