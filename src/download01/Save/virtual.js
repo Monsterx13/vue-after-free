@@ -26,22 +26,22 @@
     0x87,
     "socketpair",
     ["number", "number", "number", "bigint"],
-    "bigint",
-  );
+    "bigint"
+  )
   var socketpair = fn.socketpair;
   fn.register(
     0x76,
     "getsockopt",
     ["bigint", "number", "number", "bigint", "bigint"],
-    "bigint",
-  );
+    "bigint"
+  )
   var getsockopt = fn.getsockopt;
   fn.register(
     0x69,
     "setsockopt",
     ["bigint", "number", "number", "bigint", "number"],
-    "bigint",
-  );
+    "bigint"
+  )
   var setsockopt = fn.setsockopt;
   fn.register(0x17, "setuid", ["number"], "bigint");
   var setuid = fn.setuid;
@@ -53,15 +53,15 @@
     0x1e7,
     "cpuset_getaffinity",
     ["number", "number", "bigint", "number", "bigint"],
-    "bigint",
-  );
+    "bigint"
+  )
   var cpuset_getaffinity = fn.cpuset_getaffinity;
   fn.register(
     0x1e8,
     "cpuset_setaffinity",
     ["number", "number", "bigint", "number", "bigint"],
-    "bigint",
-  );
+    "bigint"
+  )
   var cpuset_setaffinity = fn.cpuset_setaffinity;
   fn.register(0x1d2, "rtprio_thread", ["number", "number", "bigint"], "bigint");
   var rtprio_thread = fn.rtprio_thread;
@@ -69,8 +69,8 @@
     0x63,
     "netcontrol",
     ["bigint", "number", "bigint", "number"],
-    "bigint",
-  );
+    "bigint"
+  )
   var netcontrol = fn.netcontrol;
   fn.register(0x1c7, "thr_new", ["bigint", "number"], "bigint");
   var thr_new = fn.thr_new;
@@ -231,7 +231,7 @@
     pipe_1,
     ready,
     done,
-    signal_buf,
+    signal_buf
   ) {
     return {
       rop: rop,
@@ -394,7 +394,7 @@
         ready,
         new BigInt(pipe_0),
         done,
-        signal_buf,
+        signal_buf
       );
 
       var worker = createWorker(
@@ -404,7 +404,7 @@
         pipe_1,
         ready,
         done,
-        signal_buf,
+        signal_buf
       );
       iov_recvmsg_workers[i] = worker;
     }
@@ -424,7 +424,7 @@
         ready,
         new BigInt(pipe_0),
         done,
-        signal_buf,
+        signal_buf
       );
 
       var worker = createWorker(
@@ -434,7 +434,7 @@
         pipe_1,
         ready,
         done,
-        signal_buf,
+        signal_buf
       );
       uio_readv_workers[i] = worker;
     }
@@ -454,7 +454,7 @@
         ready,
         new BigInt(pipe_0),
         done,
-        signal_buf,
+        signal_buf
       );
 
       var worker = createWorker(
@@ -464,7 +464,7 @@
         pipe_1,
         ready,
         done,
-        signal_buf,
+        signal_buf
       );
       uio_writev_workers[i] = worker;
     }
@@ -483,7 +483,7 @@
       ready,
       new BigInt(pipe_0),
       done,
-      signal_buf,
+      signal_buf
     );
 
     spray_ipv6_worker = createWorker(
@@ -493,7 +493,7 @@
       pipe_1,
       ready,
       done,
-      signal_buf,
+      signal_buf
     );
   }
 
@@ -561,7 +561,7 @@
       var ret = write(new BigInt(worker.pipe_1), worker.signal_buf, 1);
       if (ret.eq(BigInt_Error)) {
         throw new Error(
-          "Could not signal 'run' iov_recvmsg_workers[" + i + "]",
+          "Could not signal 'run' iov_recvmsg_workers[" + i + "]"
         );
       }
     }
@@ -590,7 +590,7 @@
     var ret = spawn_thread(
       spray_ipv6_worker.rop,
       spray_ipv6_worker.loop_size,
-      spray_ipv6_stack,
+      spray_ipv6_stack
     );
     if (ret.eq(BigInt_Error)) {
       throw new Error("Could not spray_ipv6_worker");
@@ -602,7 +602,7 @@
     ret = write(
       new BigInt(spray_ipv6_worker.pipe_1),
       spray_ipv6_worker.signal_buf,
-      1,
+      1
     );
     if (ret.eq(BigInt_Error)) {
       throw new Error("Could not signal 'run' spray_ipv6_worker");
